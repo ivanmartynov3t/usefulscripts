@@ -24,7 +24,8 @@ local mongod binary:
   10. Replace the old user ID with the new one (local copy only) and export
       the documents as Extended JSON in production insert order
   Inserting into production stays manual. "Clean up everything" removes the
-  container, volume, pulled image, extracted files, export and state.
+  container, volume, pulled image, extracted files, export and state; the
+  backup archive itself is never deleted.
 
 Before every command (docker, mongosh script, file/folder write or delete)
 the tool prints what it is for and the exact command, and asks to run it,
@@ -49,6 +50,7 @@ Requires Python 3.9+, Docker, and the `questionary` package:
 
 import json
 import os
+import re
 import shutil
 import socket
 import stat
@@ -512,9 +514,15 @@ def create_container(state: Dict[str, object]) -> None:
         print(f"Port {port} is already in use on 127.0.0.1.")
         return
 
+    if _create_and_start(state, version, port):
+        print("Container is up and running (empty database). Next: restore the data.")
+
+
+def _create_and_start(state: Dict[str, object], version: str, port: int) -> bool:
+    """Pull the image if needed, create volume + container and start it. Returns True when mongod is ready."""
     image = f"mongo:{version}"
     if not _pull_image(state, image):
-        return
+        return False
 
     try:
         docker("volume", "create", "--label", LABEL, VOLUME_NAME,
@@ -536,33 +544,40 @@ def create_container(state: Dict[str, object]) -> None:
         docker("start", state["container_id"], describe="Start the container (mongod starts on an empty database)")
     except DockerError as e:
         print(e)
-        return
+        return False
 
     print(f"Container {state['container_id'][:12]} created from {image}.")
-    if _wait_ready(state["container_id"]):
-        print("Container is up and running (empty database). Next: restore the data.")
+    return _wait_ready(state["container_id"])
 
 
-def _print_fcv_hint(logs: str) -> None:
-    keywords = ("featureCompatibilityVersion", "UPGRADE PROBLEM", "Wrong mongod version")
-    hits = [line for line in logs.splitlines() if any(k in line for k in keywords)]
-    if hits:
-        print("\nThe logs mention a featureCompatibilityVersion mismatch:")
-        for line in hits[-3:]:
-            print(f"  {line[:300]}")
-        print("Recreate the container with a matching MongoDB version, then restore again.")
+# mongod refuses data files written by a newer version and exits with code 62
+# ("Wrong mongod version ... featureCompatibilityVersion document ... version: \"8.0\"")
+EXIT_NEED_NEWER_MONGOD = 62
+_FCV_IN_LOG = re.compile(r'featureCompatibilityVersion\\?",\s*version:\s*\\?"(\d+\.\d+)')
+
+
+def _required_mongo_version(container_id: str) -> Optional[str]:
+    """MongoDB version the data files need, read from the stopped container's full log."""
+    logs = docker("logs", container_id, check=False)
+    match = _FCV_IN_LOG.search((logs.stdout or "") + (logs.stderr or ""))
+    return match.group(1) if match else None
 
 
 def _wait_ready(container_id: str) -> bool:
     print("Waiting for mongod to accept connections", end="", flush=True)
     deadline = time.monotonic() + READY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        if not container_running(container_id):
-            print(" - container stopped.")
-            logs = docker("logs", "--tail", "40", container_id, check=False)
-            output = (logs.stdout or "") + (logs.stderr or "")
-            print(output[-4000:])
-            _print_fcv_hint(output)
+        info = container_info(container_id)
+        if not info or not info["State"]["Running"]:
+            exit_code = info["State"]["ExitCode"] if info else None
+            required = _required_mongo_version(container_id)
+            if required:
+                print(f" - mongod stopped (exit code {exit_code}): the data files were written by MongoDB "
+                      f"{required} (featureCompatibilityVersion {required}), newer than this container's mongod.")
+            else:
+                print(f" - container stopped (exit code {exit_code}). Last log lines:")
+                logs = docker("logs", "--tail", "40", container_id, check=False)
+                print(((logs.stdout or "") + (logs.stderr or ""))[-4000:])
             return False
         r = mongosh(container_id, "db.adminCommand({ping: 1}).ok")
         if r.returncode == 0 and r.stdout.strip() == "1":
@@ -592,7 +607,29 @@ def verify_container(state: Dict[str, object]) -> bool:
         except DockerError as e:
             print(e)
             return False
-    return _wait_ready(state["container_id"])
+    if _wait_ready(state["container_id"]):
+        return True
+    _offer_version_fix(state)
+    return False
+
+
+def _offer_version_fix(state: Dict[str, object]) -> None:
+    """After mongod refused the data files, offer to recreate the container with the version they need."""
+    if not state["container_id"]:
+        return
+    required = _required_mongo_version(state["container_id"])
+    if not required or required == state["mongo_version"]:
+        return
+    print(f"\nThe backup needs MongoDB {required}; the container runs {state['image']}.")
+    print(f"Fix: replace the container and its data volume with a mongo:{required} one (same port "
+          f"{state['port']}) and restore the extracted backup into it again. The extracted files stay as they are.")
+    if not questionary.confirm(f"Recreate the container with MongoDB {required} and restore again?",
+                               default=True).ask():
+        return
+    port = state["port"]
+    _remove_container_and_volume(state)
+    if _create_and_start(state, required, port):
+        restore_data(state)
 
 
 def restore_data(state: Dict[str, object]) -> None:
@@ -625,6 +662,7 @@ def restore_data(state: Dict[str, object]) -> None:
         return
 
     if not _wait_ready(cid):
+        _offer_version_fix(state)
         return
     state["restored"] = True
     save_state(state)
@@ -810,7 +848,7 @@ def find_documents(state: Dict[str, object]) -> None:
 
     print(f"\nFolders created by {state['old_user_id']}:")
     for f in result["folders"]:
-        print(f"  {f['id']}  {f['name']}" + ("  (marked deleted)" if f["deleted"] else ""))
+        print(f"  {f['id']}  {f['name']}" + ("  (marked deleted)" if f.get("deleted") else ""))
     if not result["folders"]:
         print("  none")
     print("\nDocuments to recover (production insert order):")
@@ -998,11 +1036,6 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
     _remove_extract_dir(state)
     _remove_export_dir(state)
 
-    if state["archive"] and Path(state["archive"]).is_file() and questionary.confirm(
-            f"Also delete the backup archive {state['archive']}?", default=False).ask():
-        Path(state["archive"]).unlink()
-        print(f"Removed {state['archive']}")
-
     leftovers = (state["images_pulled"] or state["extract_dir"] or state["export_dir"]
                  or state["container_id"] or state["volume"])
     if leftovers:
@@ -1046,7 +1079,9 @@ STEPS = [
     Step("create", "Create MongoDB container", True, create_container,
          lambda s: bool(s["container_id"]),
          "Downloads the MongoDB image if needed, creates a data volume and a container that is\n"
-         "reachable from this machine only. The version must match the backup (6.0 per the runbook)."),
+         "reachable from this machine only. The version should match the backup (the runbook used 6.0;\n"
+         "newer backups need 7.0 or 8.0). If it doesn't match, the restore step detects the required\n"
+         "version and offers to recreate the container with it."),
     Step("verify", "Verify container is running", True, verify_container,
          lambda s: bool(s["container_id"]) and container_running(s["container_id"]),
          "Checks that the container runs and mongod answers; offers to start it if it is stopped."),

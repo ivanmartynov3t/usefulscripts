@@ -60,8 +60,11 @@ Workflow steps, in order:
 4. **Create MongoDB container** - pulls `mongo:<version>` if needed, creates a
    labelled volume and container, publishes the port on `127.0.0.1` only
    (default `50000`). The version must match the backup's
-   featureCompatibilityVersion (6.0 at the time the runbook was written);
-   if it doesn't, the container stops and the tool points at the log lines
+   featureCompatibilityVersion (6.0 when the runbook was written; current
+   backups may need 7.0 or 8.0). If the data files are newer than the
+   container's mongod, it exits with code 62; the tool reads the required
+   version from the log and offers to recreate the container with that
+   version and restore again
 5. **Verify container is running** - starts it if stopped, waits for `ping`
 6. **Restore data into container** - stops the container, clears the volume,
    copies the extracted data files in, starts it again and runs step 7
@@ -101,8 +104,7 @@ Separate menu entry, run when the recovery is finished:
 
 - **Clean up everything** - removes the container, its volume, the image
   (only if this tool pulled it), the extracted folder, the export folder and
-  the state file. Deleting the original archive is offered separately
-  (default: no)
+  the state file. The backup archive itself is never deleted.
 
 ## Restarts
 
