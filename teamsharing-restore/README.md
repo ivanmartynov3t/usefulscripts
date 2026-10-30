@@ -59,26 +59,29 @@ Workflow steps, in order:
 2. **Select backup archive** - lists the `.tar.gz` / `.tgz` files found in
    the working folder (newest first, with size and date); "Another file..."
    lets you enter any other path
-3. **Extract archive** - also locates the folder holding the `WiredTiger` files
-4. **Create MongoDB container** - pulls `mongo:<version>` if needed, creates a
-   labelled volume and container, publishes the port on `127.0.0.1` only
-   (default `50000`). The version must match the backup's
-   featureCompatibilityVersion (6.0 when the runbook was written; current
-   backups may need 7.0 or 8.0). If the data files are newer than the
-   container's mongod, it exits with code 62; the tool reads the required
-   version from the log and offers to recreate the container with that
-   version and restore again
-5. **Verify container is running** - starts it if stopped, waits for `ping`
-6. **Restore data into container** - stops the container, clears the volume,
-   copies the extracted data files in, starts it again and runs step 7
-7. **Verify databases** - lists databases, featureCompatibilityVersion and
-   document counts of the collections the runbook needs
-   (`TEAM_SHARING_ENCRYPTED_PROD.{user,folder,resource,resourceContent,permission}`,
-   `ENCRYPTION_PROD.__keyVault`)
-8. **Identify the affected user IDs** - looks the email up in `user`
+3. **Restore backup into local MongoDB** - one step that:
+   - extracts the archive and locates the folder holding the `WiredTiger` files
+   - pulls `mongo:<version>` if needed (default 7.0), creates a labelled
+     volume and container (not started yet), port published on `127.0.0.1`
+     only (default `50000`)
+   - copies the backup files into the container and starts MongoDB once
+   - if the data files are newer than the container's mongod (exit code 62),
+     reads the required version from the log and offers to recreate the
+     container with it and load the backup again
+   - verifies the databases: featureCompatibilityVersion and document counts
+     of the collections the runbook needs
+     (`TEAM_SHARING_ENCRYPTED_PROD.{user,folder,resource,resourceContent,permission}`,
+     `ENCRYPTION_PROD.__keyVault`)
+
+   Parts already done are skipped: after a restart it only starts the
+   stopped container.
+4. **Identify the affected user IDs** - looks the email up in `user`
    (case-insensitive); you pick the old ID that lost its data (typically
-   `google-oauth2|...`, no license) and the ID that should own it now
-9. **Find the deleted documents** - the runbook's queries, for all of the
+   `google-oauth2|...`, no license) and the ID that should own it now.
+   If the user has only one ID (data deleted, not moved to another
+   account), choose **Same ID** - the documents are then recovered
+   unchanged
+5. **Find the deleted documents** - the runbook's queries, for all of the
    old user's folders at once:
 
    | Collection | Query |
@@ -90,13 +93,15 @@ Workflow steps, in order:
    | `ENCRYPTION_PROD.__keyVault` | `{keyAltNames: {$in: ["data-key-1-folder-key-<folderId>", ...]}}` |
 
    Warns if a folder has no encryption key.
-10. **Fix ownership and export** - replaces every value equal to the old ID
+6. **Fix ownership and export** - replaces every value equal to the old ID
     with the new ID, in the **local** restored copy and in JSON files
     (MongoDB Extended JSON, canonical) written to
     `<working folder>/teamsharing-recovery-export/`, numbered in the
     production insert order: `1-…__keyVault`, `2-…folder`,
     `3-…permission`, `4-…resource`, `5-…resourceContent`. Documents that
     still mention the old ID inside a longer value are flagged for review.
+    With **Same ID** nothing is replaced: the documents are exported as they
+    are in the backup and the local copy is not modified.
 
 The production insert itself stays manual, as in the runbook: with
 production access, insert the documents in the order above - copy them in
@@ -107,7 +112,10 @@ Separate menu entry, run when the recovery is finished:
 
 - **Clean up everything** - removes the container, its volume, the image
   (only if this tool pulled it), the extracted folder, the export folder and
-  the state file. The backup archive itself is never deleted.
+  the state file. The backup archive itself is never deleted. Removing the
+  container with `-v` also removes the unnamed `/data/configdb` volume the
+  mongo image creates. Afterwards it checks that every removed item is really
+  gone (and that no labelled containers or volumes remain) and prints the result.
 
 ## Restarts
 

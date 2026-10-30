@@ -10,20 +10,20 @@ Guided wizard for the Ops runbook "How to recover a user's Team Sharing data
 in case it was erroneously deleted". MongoDB runs inside Docker instead of a
 local mongod binary:
 
-   1. Select the working folder that holds the backup (e.g. Downloads)
-   2. Select the MongoDB Atlas snapshot archive (.tar.gz / .tgz) from the
-      archives found there, or enter another path
-   3. Extract the archive into it
-   4. Create and start a MongoDB container (version must match the backup's
-      featureCompatibilityVersion - 6.0 at the time the runbook was written)
-   5. Verify the container is up and mongod answers
-   6. Restore the extracted data files into the container's Docker volume
-   7. Verify the restored databases (TEAM_SHARING_ENCRYPTED_PROD, ENCRYPTION_PROD)
-   8. Identify the old (unlicensed) and new user ID by the user's email
-   9. Find the deleted documents: folders, resources, resource contents,
-      permissions and folder keys in ENCRYPTION_PROD.__keyVault
-  10. Replace the old user ID with the new one (local copy only) and export
-      the documents as Extended JSON in production insert order
+  1. Select the working folder that holds the backup (e.g. Downloads)
+  2. Select the MongoDB Atlas snapshot archive (.tar.gz / .tgz) from the
+     archives found there, or enter another path
+  3. Restore the backup into local MongoDB: extract it, create a container
+     (not started), copy the data in, start MongoDB once and verify the
+     databases. A too-old MongoDB version is detected from the log (exit
+     code 62) and the container is recreated with the required version.
+  4. Identify the old and new user ID by the user's email ("Same ID" when
+     the user has only one ID)
+  5. Find the deleted documents: folders, resources, resource contents,
+     permissions and folder keys in ENCRYPTION_PROD.__keyVault
+  6. Replace the old user ID with the new one (local copy only; skipped for
+     "Same ID") and export the documents as Extended JSON in production
+     insert order
   Inserting into production stays manual. "Clean up everything" removes the
   container, volume, pulled image, extracted files, export and state; the
   backup archive itself is never deleted.
@@ -61,7 +61,7 @@ import tarfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, List, NamedTuple, Optional
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 try:
     import questionary
@@ -81,8 +81,8 @@ VOLUME_NAME = "teamsharing-restore-data"
 DATA_DIR_IN_CONTAINER = "/data/db"
 EXTRACT_MARKER = ".teamsharing-restore"
 DEFAULT_PORT = 50000
-DEFAULT_MONGO_VERSION = "6.0"
-MONGO_VERSIONS = ["6.0", "7.0", "8.0", "5.0"]
+DEFAULT_MONGO_VERSION = "7.0"
+MONGO_VERSIONS = ["7.0", "8.0", "6.0", "5.0"]
 READY_TIMEOUT_SECONDS = 120
 
 # Databases / collections the runbook works with
@@ -519,43 +519,31 @@ def _remove_container_and_volume(state: Dict[str, object]) -> None:
     save_state(state)
 
 
-def create_container(state: Dict[str, object]) -> None:
-    if state["container_id"]:
-        if not questionary.confirm("A container already exists. Remove it (and its data volume) and create "
-                                   "a new one?", default=False).ask():
-            return
-        _remove_container_and_volume(state)
-
-    if container_info(CONTAINER_NAME):
-        print(f"A container named '{CONTAINER_NAME}' exists but is not tracked. Run cleanup first.")
-        return
-
+def _ask_version_and_port(state: Dict[str, object]) -> Optional[Tuple[str, int]]:
     version = questionary.select(
-        "MongoDB version (must match the backup's featureCompatibilityVersion):",
+        "MongoDB version (should match the backup; a mismatch is detected and fixed automatically):",
         choices=MONGO_VERSIONS + ["Other..."], default=state["mongo_version"] or DEFAULT_MONGO_VERSION).ask()
     if not version:
-        return
+        return None
     if version == "Other...":
-        version = (questionary.text("Image tag (e.g. 6.0.19):").ask() or "").strip()
+        version = (questionary.text("Image tag (e.g. 7.0.14):").ask() or "").strip()
         if not version:
-            return
+            return None
 
     port_answer = questionary.text("Host port (bound to 127.0.0.1 only):", default=str(state["port"] or DEFAULT_PORT),
                                    validate=lambda v: v.isdigit() and 1024 <= int(v) <= 65535 or
                                    "Enter a port between 1024 and 65535").ask()
     if not port_answer:
-        return
+        return None
     port = int(port_answer)
     if not port_free(port):
         print(f"Port {port} is already in use on 127.0.0.1.")
-        return
-
-    if _create_and_start(state, version, port):
-        print("Container is up and running (empty database). Next: restore the data.")
+        return None
+    return version, port
 
 
-def _create_and_start(state: Dict[str, object], version: str, port: int) -> bool:
-    """Pull the image if needed, create volume + container and start it. Returns True when mongod is ready."""
+def _create_container(state: Dict[str, object], version: str, port: int) -> bool:
+    """Pull the image if needed and create the volume + container (not started yet)."""
     image = f"mongo:{version}"
     if not _pull_image(state, image):
         return False
@@ -577,13 +565,11 @@ def _create_and_start(state: Dict[str, object], version: str, port: int) -> bool
         state["port"] = port
         state["restored"] = False
         save_state(state)
-        docker("start", state["container_id"], describe="Start the container (mongod starts on an empty database)")
     except DockerError as e:
         print(e)
         return False
-
-    print(f"Container {state['container_id'][:12]} created from {image}.")
-    return _wait_ready(state["container_id"])
+    print(f"Container {state['container_id'][:12]} created from {image} (not started yet).")
+    return True
 
 
 # mongod refuses data files written by a newer version and exits with code 62
@@ -625,90 +611,96 @@ def _wait_ready(container_id: str) -> bool:
     return False
 
 
-def verify_container(state: Dict[str, object]) -> bool:
-    if not state["container_id"]:
-        print("No container yet - create it first.")
-        return False
-    info = container_info(state["container_id"])
-    if not info:
-        print("Tracked container no longer exists.")
-        reconcile(state, True)
-        return False
-    if not info["State"]["Running"]:
-        print(f"Container is {info['State']['Status']}.")
-        if not questionary.confirm("Start it now?", default=True).ask():
-            return False
-        try:
-            docker("start", state["container_id"], describe="Start the stopped container")
-        except DockerError as e:
-            print(e)
-            return False
-    if _wait_ready(state["container_id"]):
-        return True
-    _offer_version_fix(state)
-    return False
-
-
-def _offer_version_fix(state: Dict[str, object]) -> None:
+def _offer_version_fix(state: Dict[str, object]) -> bool:
     """After mongod refused the data files, offer to recreate the container with the version they need."""
     if not state["container_id"]:
-        return
+        return False
     required = _required_mongo_version(state["container_id"])
     if not required or required == state["mongo_version"]:
-        return
+        return False
     print(f"\nThe backup needs MongoDB {required}; the container runs {state['image']}.")
     print(f"Fix: replace the container and its data volume with a mongo:{required} one (same port "
-          f"{state['port']}) and restore the extracted backup into it again. The extracted files stay as they are.")
-    if not questionary.confirm(f"Recreate the container with MongoDB {required} and restore again?",
+          f"{state['port']}) and load the extracted backup into it again. The extracted files stay as they are.")
+    if not questionary.confirm(f"Recreate the container with MongoDB {required} and load the backup again?",
                                default=True).ask():
-        return
+        return False
     port = state["port"]
     _remove_container_and_volume(state)
-    if _create_and_start(state, required, port):
-        restore_data(state)
+    return _create_container(state, required, port) and _load_backup(state)
 
 
-def restore_data(state: Dict[str, object]) -> None:
-    if not state["dbpath"] or not Path(state["dbpath"]).is_dir():
-        print("Extract the archive first.")
-        return
-    if not state["container_id"] or not state["volume"]:
-        print("Create the container first.")
-        return
-    if state["restored"] and not questionary.confirm(
-            "Data was already restored. Wipe the container's data and restore again?", default=False).ask():
-        return
-
+def _load_backup(state: Dict[str, object]) -> bool:
+    """Copy the extracted backup into the container's data volume and start mongod on it."""
     cid = state["container_id"]
-    try:
+    info = container_info(cid)
+    if not info:
+        print("Tracked container no longer exists.")
+        return False
+    started_before = not str(info["State"].get("StartedAt", "")).startswith("0001-")
+    state["restored"] = state["db_verified"] = False
+    state["found_counts"] = None
+    save_state(state)
+    if info["State"]["Running"]:
         docker("stop", cid, describe="Stop the container so mongod releases the data files")
+    if started_before:
         docker("run", "--rm", "--label", LABEL, "-v", f"{state['volume']}:{DATA_DIR_IN_CONTAINER}",
                "--entrypoint", "sh", state["image"], "-c", f"find {DATA_DIR_IN_CONTAINER} -mindepth 1 -delete",
-               describe=f"Empty the data volume '{state['volume']}' using a temporary helper container "
-                        f"(removed automatically when done)")
-        state["restored"] = state["db_verified"] = False
-        state["found_counts"] = None
-        save_state(state)
-        docker("cp", str(Path(state["dbpath"])) + os.sep + ".", f"{cid}:{DATA_DIR_IN_CONTAINER}",
-               describe=f"Copy the extracted backup files into the container's {DATA_DIR_IN_CONTAINER} "
-                        f"(can take a few minutes)")
-        docker("start", cid, describe="Start the container on the restored data")
-    except DockerError as e:
-        print(e)
-        return
-
+               describe=f"Empty the data volume '{state['volume']}' (it holds data from an earlier start) "
+                        f"using a temporary helper container, removed automatically when done")
+    docker("cp", str(Path(state["dbpath"])) + os.sep + ".", f"{cid}:{DATA_DIR_IN_CONTAINER}",
+           describe=f"Copy the extracted backup files into the container's {DATA_DIR_IN_CONTAINER} "
+                    f"(can take a few minutes)")
+    docker("start", cid, describe="Start MongoDB on the restored backup")
     if not _wait_ready(cid):
-        _offer_version_fix(state)
-        return
+        return _offer_version_fix(state)
     state["restored"] = True
     save_state(state)
-    print("Data restored.")
+    print("Backup restored.")
+    return True
+
+
+def restore_backup(state: Dict[str, object]) -> None:
+    """Extract the archive, create the container, load the backup, start MongoDB and verify -
+    skipping whatever is already done (e.g. after a restart only the stopped container is started)."""
+    if not state["archive"] or not state["workdir"]:
+        print("Select the working folder and the archive first.")
+        return
+
+    if state["dbpath"] and Path(state["dbpath"]).is_dir():
+        print(f"Using the already extracted backup in {state['extract_dir']}")
+    else:
+        extract_archive(state)
+        if not state["dbpath"]:
+            return
+
+    cid = state["container_id"]
+    if not cid:
+        if container_info(CONTAINER_NAME):
+            print(f"A container named '{CONTAINER_NAME}' exists but is not tracked. Run cleanup first.")
+            return
+        answer = _ask_version_and_port(state)
+        if not answer or not _create_container(state, *answer):
+            return
+    elif state["restored"]:
+        if container_running(cid):
+            if questionary.confirm("The backup is already restored and MongoDB is running. Load it again from "
+                                   "the extracted files (discards changes made in the local copy)?",
+                                   default=False).ask():
+                state["restored"] = False
+        else:
+            print("MongoDB container is stopped (e.g. after a restart).")
+            docker("start", cid, describe="Start the stopped container")
+            if not _wait_ready(cid) and not _offer_version_fix(state):
+                return
+
+    if not state["restored"] and not _load_backup(state):
+        return
     verify_databases(state)
 
 
 def verify_databases(state: Dict[str, object]) -> None:
     if not state["container_id"] or not container_running(state["container_id"]):
-        print("Container is not running - use 'Verify container' first.")
+        print("MongoDB is not running - run the restore step first.")
         return
     script = (
         "const out = {fcv: null, dbs: []};\n"
@@ -776,10 +768,16 @@ def _run_json(state: Dict[str, object], script: str, describe: str) -> Optional[
         return None
 
 
+SAME_ID = "__same__"
+
+
 def _choose_user_id(question: str, users: List[Dict[str, object]], exclude: Optional[str],
                     default: Optional[str]) -> Optional[str]:
     choices = [questionary.Choice(f"{u['userId']}  (license: {'assigned' if u['licensed'] else 'none'})",
                                   u["userId"]) for u in users if u["userId"] != exclude]
+    if exclude:
+        choices.append(questionary.Choice(
+            f"Same ID ({exclude}) - the data was deleted, not moved: recover it unchanged", SAME_ID))
     choices.append(questionary.Choice("Enter manually...", "__manual__"))
     values = [c.value for c in choices]
     answer = questionary.select(question, choices=choices,
@@ -818,20 +816,25 @@ def identify_user(state: Dict[str, object]) -> None:
     if not old_id:
         return
     licensed = next((u["userId"] for u in users if u["licensed"] and u["userId"] != old_id), None)
-    new_id = _choose_user_id("Which ID should own the recovered data?", users, old_id,
-                             state["new_user_id"] or licensed)
+    if state["new_user_id"] and state["new_user_id"] == state["old_user_id"] == old_id:
+        default_new = SAME_ID
+    else:
+        default_new = state["new_user_id"] or licensed or SAME_ID
+    new_id = _choose_user_id("Which ID should own the recovered data?", users, old_id, default_new)
     if not new_id:
         return
-    if new_id == old_id:
-        print("The old and new user ID must differ.")
-        return
+    if new_id == SAME_ID:
+        new_id = old_id
 
     if (old_id, new_id, email) != (state["old_user_id"], state["new_user_id"], state["email"]):
         state["found_counts"] = None
         state["exported_for"] = None
     state["email"], state["old_user_id"], state["new_user_id"] = email, old_id, new_id
     save_state(state)
-    print(f"Recovering data of {old_id} -> {new_id}")
+    if old_id == new_id:
+        print(f"Recovering data of {old_id} unchanged (same owner, no ID replacement).")
+    else:
+        print(f"Recovering data of {old_id} -> {new_id}")
 
 
 def _find_documents_js(state: Dict[str, object]) -> str:
@@ -922,14 +925,53 @@ def fix_and_export(state: Dict[str, object]) -> None:
     if not state["found_counts"]:
         print("Find the affected documents first.")
         return
-    print(f"Every value equal to {state['old_user_id']} is replaced with {state['new_user_id']}, both in the")
-    print("local restored copy (so you can copy the documents from Studio 3T) and in the exported files.")
+    same_owner = state["old_user_id"] == state["new_user_id"]
+    if same_owner:
+        print(f"Same owner ({state['old_user_id']}): the documents are exported unchanged and the local")
+        print("restored copy is not modified.")
+    else:
+        print(f"Every value equal to {state['old_user_id']} is replaced with {state['new_user_id']}, both in the")
+        print("local restored copy (so you can copy the documents from Studio 3T) and in the exported files.")
     print("Nothing is written to production.")
     export_dir = _prepare_export_dir(state)
     if not export_dir:
         return
 
-    result = _run_json(state, _find_documents_js(state) + (
+    if same_owner:
+        result = _run_json(state, _find_documents_js(state) + (
+            "const leftovers = Object.fromEntries(Object.keys(found).map(k => [k, '0']));\n"
+            "print(EJSON.stringify({docs: found, leftovers: leftovers}, {relaxed: false}));\n"
+        ), "Read-only query: read the found documents for export (no changes)")
+    else:
+        result = _run_fix_ownership(state)
+    if result is None:
+        return
+
+    approve("Write the export files", "\n".join(
+        f"write  {export_dir / f'{i}-{name}.json'}  ({len(result['docs'][name])} documents)"
+        for i, name in enumerate(EXPORT_ORDER, 1)))
+    print(f"\nExported to {export_dir} (MongoDB Extended JSON, one array per file):")
+    total_left = 0
+    for i, name in enumerate(EXPORT_ORDER, 1):
+        docs = result["docs"][name]
+        path = export_dir / f"{i}-{name}.json"
+        path.write_text(json.dumps(docs, indent=2), encoding="utf-8")
+        left = int(result["leftovers"][name])
+        total_left += left
+        note = f"  ! {left} document(s) still mention the old ID" if left else ""
+        print(f"  {path.name:<54} {len(docs):>6} document(s){note}")
+    if same_owner:
+        print("Documents exported unchanged.")
+    elif total_left:
+        print("! The old ID still appears inside some values (not as a whole value). Review those documents.")
+    else:
+        print("No references to the old user ID remain.")
+    state["exported_for"] = [state["old_user_id"], state["new_user_id"]]
+    save_state(state)
+
+
+def _run_fix_ownership(state: Dict[str, object]) -> Optional[object]:
+    return _run_json(state, _find_documents_js(state) + (
         "const isPlain = v => v !== null && typeof v === 'object' && !v._bsontype\n"
         "  && Object.prototype.toString.call(v) === '[object Object]';\n"
         "const fix = v => {\n"
@@ -949,28 +991,6 @@ def fix_and_export(state: Dict[str, object]) -> None:
         "print(EJSON.stringify({docs: found, leftovers: leftovers}, {relaxed: false}));\n"
     ), f"WRITE to the LOCAL restored copy only: replace {state['old_user_id']} with {state['new_user_id']} "
        f"in the found documents (replaceOne per document) and return them for export")
-    if result is None:
-        return
-
-    approve("Write the export files", "\n".join(
-        f"write  {export_dir / f'{i}-{name}.json'}  ({len(result['docs'][name])} documents)"
-        for i, name in enumerate(EXPORT_ORDER, 1)))
-    print(f"\nExported to {export_dir} (MongoDB Extended JSON, one array per file):")
-    total_left = 0
-    for i, name in enumerate(EXPORT_ORDER, 1):
-        docs = result["docs"][name]
-        path = export_dir / f"{i}-{name}.json"
-        path.write_text(json.dumps(docs, indent=2), encoding="utf-8")
-        left = int(result["leftovers"][name])
-        total_left += left
-        note = f"  ! {left} document(s) still mention the old ID" if left else ""
-        print(f"  {path.name:<54} {len(docs):>6} document(s){note}")
-    if total_left:
-        print("! The old ID still appears inside some values (not as a whole value). Review those documents.")
-    else:
-        print("No references to the old user ID remain.")
-    state["exported_for"] = [state["old_user_id"], state["new_user_id"]]
-    save_state(state)
 
 
 def print_production_instructions(state: Dict[str, object]) -> None:
@@ -1031,6 +1051,7 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
     if state["volume"]:
         volumes.add(state["volume"])
     images = [i for i in state["images_pulled"] if docker_ok and image_exists(i)]
+    folders = [f for f in (state["extract_dir"], state["export_dir"]) if f]
 
     print("\nCleanup will permanently remove:")
     for c in containers:
@@ -1085,7 +1106,30 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
         pass
     state.clear()
     state.update(_empty_state())
-    print("Cleanup complete - nothing left behind.")
+    _verify_cleanup(containers, volumes, images, folders)
+
+
+def _verify_cleanup(containers, volumes, images, folders) -> None:
+    """Check that everything cleanup removed is really gone, including untracked labelled leftovers."""
+    print("\nVerifying cleanup:")
+    problems = []
+    checks = (
+        [(f"container {c[:12]}", container_info(c) is None) for c in containers]
+        + [("no labelled containers left", not labelled_containers())]
+        + [(f"volume {v}", not volume_exists(v)) for v in volumes]
+        + [("no labelled volumes left", not labelled_volumes())]
+        + [(f"image {i}", not image_exists(i)) for i in images]
+        + [(f"folder {f}", not Path(f).exists()) for f in folders]
+        + [(f"state file {STATE_FILE}", not STATE_FILE.exists())]
+    )
+    for what, gone in checks:
+        print(f"  {'OK  ' if gone else 'LEFT'}  {what}")
+        if not gone:
+            problems.append(what)
+    if problems:
+        print(f"! {len(problems)} item(s) still exist - run cleanup again or remove them manually.")
+    else:
+        print("Cleanup complete - verified that nothing is left behind (the backup archive is kept).")
 
 
 # ---------------------------------------------------------------------------
@@ -1111,37 +1155,28 @@ STEPS = [
          lambda s: bool(s["archive"]),
          "Pick the daily Atlas snapshot (.tar.gz, ~300 MB) from the archives found in the working\n"
          "folder, or enter another path. Nothing is changed."),
-    Step("extract", "Extract archive", False, extract_archive,
-         lambda s: bool(s["dbpath"]),
-         "Unpacks the snapshot (~1 GB) into a new subfolder and finds the MongoDB data files."),
-    Step("create", "Create MongoDB container", True, create_container,
-         lambda s: bool(s["container_id"]),
-         "Downloads the MongoDB image if needed, creates a data volume and a container that is\n"
-         "reachable from this machine only. The version should match the backup (the runbook used 6.0;\n"
-         "newer backups need 7.0 or 8.0). If it doesn't match, the restore step detects the required\n"
-         "version and offers to recreate the container with it."),
-    Step("verify", "Verify container is running", True, verify_container,
-         lambda s: bool(s["container_id"]) and container_running(s["container_id"]),
-         "Checks that the container runs and mongod answers; offers to start it if it is stopped."),
-    Step("restore", "Restore data into container", True, restore_data,
-         lambda s: bool(s["restored"]),
-         "Stops the container, empties its data volume, copies the extracted backup files in and\n"
-         "starts it again, then checks the databases."),
-    Step("verify_db", "Verify databases", True, verify_databases,
-         lambda s: bool(s["restored"] and s["db_verified"]),
-         "Read-only check that all collections the runbook needs exist, with document counts."),
+    Step("restore", "Restore backup into local MongoDB", True, restore_backup,
+         lambda s: bool(s["restored"] and s["db_verified"] and s["container_id"]
+                        and container_running(s["container_id"])),
+         "Extracts the archive (~1 GB) into a new subfolder, downloads the MongoDB image if needed,\n"
+         "creates a data volume and a container reachable from this machine only, copies the backup\n"
+         "in, starts MongoDB and checks that all collections the runbook needs exist.\n"
+         "If the backup needs a newer MongoDB version, this is detected and the container is\n"
+         "recreated with it. Parts that are already done are skipped (after a restart it only\n"
+         "starts the stopped container)."),
     Step("identify", "Identify the affected user IDs", True, identify_user,
          lambda s: bool(s["old_user_id"] and s["new_user_id"]),
-         "Looks up the user's email in the user collection. You choose the old ID that lost its data\n"
-         "(usually google-oauth2|..., no license) and the ID that should own it now (licensed)."),
+         "Looks up the user's email in the user collection. You choose the ID that lost its data\n"
+         "(runbook case: google-oauth2|..., no license) and the ID that should own it now (licensed).\n"
+         "If the user has only one ID, choose 'Same ID' to recover the data unchanged."),
     Step("find", "Find the deleted documents", True, find_documents,
          lambda s: bool(s["old_user_id"] and s["found_counts"]),
          "Read-only queries from the runbook: folders created by the old ID, their resources and\n"
          "resource contents, related permissions, and each folder's encryption key in __keyVault."),
     Step("export", "Fix ownership and export", True, fix_and_export,
          lambda s: bool(s["export_dir"] and s["exported_for"] == [s["old_user_id"], s["new_user_id"]]),
-         "Replaces the old user ID with the new one in the found documents (local copy only) and\n"
-         "writes them as JSON files, numbered in the order they must be inserted into production."),
+         "Replaces the old user ID with the new one in the found documents (local copy only; skipped\n"
+         "for 'Same ID') and writes them as JSON files, numbered in production insert order."),
 ]
 
 
