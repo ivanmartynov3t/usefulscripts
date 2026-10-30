@@ -10,8 +10,9 @@ Guided wizard for the Ops runbook "How to recover a user's Team Sharing data
 in case it was erroneously deleted". MongoDB runs inside Docker instead of a
 local mongod binary:
 
-   1. Select a MongoDB Atlas snapshot archive (.tar.gz / .tgz)
-   2. Select a working folder
+   1. Select the working folder that holds the backup (e.g. Downloads)
+   2. Select the MongoDB Atlas snapshot archive (.tar.gz / .tgz) from the
+      archives found there, or enter another path
    3. Extract the archive into it
    4. Create and start a MongoDB container (version must match the backup's
       featureCompatibilityVersion - 6.0 at the time the runbook was written)
@@ -348,7 +349,16 @@ def _is_archive(p: str) -> bool:
     return p.lower().endswith((".tar.gz", ".tgz"))
 
 
-def select_archive(state: Dict[str, object]) -> None:
+def _archives_in(folder: Path) -> List[Path]:
+    """Backup archives directly inside `folder`, newest first."""
+    try:
+        found = [p for p in folder.iterdir() if p.is_file() and _is_archive(p.name)]
+    except OSError:
+        return []
+    return sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _ask_archive_path(default: str) -> Optional[str]:
     def validate(p: str):
         path = Path(p.strip().strip('"')).expanduser()
         if not path.is_file():
@@ -357,11 +367,32 @@ def select_archive(state: Dict[str, object]) -> None:
             return "Expected a .tar.gz or .tgz archive"
         return True
 
-    answer = questionary.path("Backup archive (.tar.gz):", default=state["archive"] or "",
-                              validate=validate).ask()
+    answer = questionary.path("Backup archive (.tar.gz):", default=default, validate=validate).ask()
+    return answer.strip().strip('"') if answer else None
+
+
+def select_archive(state: Dict[str, object]) -> None:
+    folder = Path(state["workdir"]) if state["workdir"] else None
+    archives = _archives_in(folder) if folder else []
+    if archives:
+        choices = []
+        for p in archives:
+            st = p.stat()
+            modified = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+            choices.append(questionary.Choice(f"{p.name}  ({st.st_size / 1024 / 1024:.0f} MB, {modified})", str(p)))
+        choices.append(questionary.Choice("Another file...", "__other__"))
+        current = state["archive"] if state["archive"] in [str(p) for p in archives] else str(archives[0])
+        answer = questionary.select(f"Backup archives in {folder} (newest first):", choices=choices,
+                                    default=current).ask()
+        if answer == "__other__":
+            answer = _ask_archive_path(str(folder) + os.sep)
+    else:
+        if folder:
+            print(f"No .tar.gz / .tgz archive found in {folder}.")
+        answer = _ask_archive_path(state["archive"] or (str(folder) + os.sep if folder else ""))
     if not answer:
         return
-    state["archive"] = str(Path(answer.strip().strip('"')).expanduser().resolve())
+    state["archive"] = str(Path(answer).expanduser().resolve())
     save_state(state)
     print(f"Archive selected: {state['archive']}")
 
@@ -370,13 +401,18 @@ def select_workdir(state: Dict[str, object]) -> None:
     def validate(p: str):
         return True if Path(p.strip().strip('"')).expanduser().is_dir() else "Folder does not exist"
 
-    answer = questionary.path("Working folder (archive is extracted into a new subfolder here):",
-                              default=state["workdir"] or "", only_directories=True, validate=validate).ask()
+    downloads = Path.home() / "Downloads"
+    default = state["workdir"] or (str(downloads) if downloads.is_dir() else "")
+    answer = questionary.path("Working folder (where the backup archive is; data is extracted and exported "
+                              "into new subfolders here):",
+                              default=default, only_directories=True, validate=validate).ask()
     if not answer:
         return
     state["workdir"] = str(Path(answer.strip().strip('"')).expanduser().resolve())
     save_state(state)
     print(f"Working folder selected: {state['workdir']}")
+    found = _archives_in(Path(state["workdir"]))
+    print(f"Found {len(found)} backup archive(s) there." if found else "No backup archive (.tar.gz) found there.")
 
 
 def _safe_extract_member(tar: tarfile.TarFile, member: tarfile.TarInfo, dest: Path) -> None:
@@ -1066,13 +1102,15 @@ class Step(NamedTuple):
 
 
 STEPS = [
-    Step("archive", "Select backup archive (.tar.gz)", False, select_archive,
-         lambda s: bool(s["archive"]),
-         "Pick the daily Atlas snapshot (.tar.gz, ~300 MB) you received for the recovery. Nothing is changed."),
     Step("workdir", "Select working folder", False, select_workdir,
          lambda s: bool(s["workdir"]),
-         "Pick a folder with ~2 GB free space. The archive is extracted into a new subfolder there,\n"
-         "and the recovered documents are exported there later. Nothing is changed yet."),
+         "Pick the folder that holds the backup archive (e.g. Downloads), with ~2 GB free space.\n"
+         "The archive is extracted into a new subfolder there, and the recovered documents are\n"
+         "exported there later. Nothing is changed yet."),
+    Step("archive", "Select backup archive (.tar.gz)", False, select_archive,
+         lambda s: bool(s["archive"]),
+         "Pick the daily Atlas snapshot (.tar.gz, ~300 MB) from the archives found in the working\n"
+         "folder, or enter another path. Nothing is changed."),
     Step("extract", "Extract archive", False, extract_archive,
          lambda s: bool(s["dbpath"]),
          "Unpacks the snapshot (~1 GB) into a new subfolder and finds the MongoDB data files."),

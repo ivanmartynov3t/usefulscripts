@@ -53,9 +53,12 @@ mongod `ping` while waiting for startup) run without asking.
 
 Workflow steps, in order:
 
-1. **Select backup archive** - the `.tar.gz` / `.tgz` snapshot downloaded from Atlas
-2. **Select working folder** - the archive is extracted into a new
+1. **Select working folder** - the folder holding the downloaded backup
+   (defaults to `Downloads`); the archive is extracted into a new
    `teamsharing-restore-<archive name>` subfolder here
+2. **Select backup archive** - lists the `.tar.gz` / `.tgz` files found in
+   the working folder (newest first, with size and date); "Another file..."
+   lets you enter any other path
 3. **Extract archive** - also locates the folder holding the `WiredTiger` files
 4. **Create MongoDB container** - pulls `mongo:<version>` if needed, creates a
    labelled volume and container, publishes the port on `127.0.0.1` only
