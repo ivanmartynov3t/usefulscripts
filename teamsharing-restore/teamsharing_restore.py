@@ -351,7 +351,9 @@ def print_status(state: Dict[str, object], docker_ok: bool) -> None:
     if state["found_counts"]:
         show("Found", ", ".join(f"{k.split('.')[-1]}: {v}" for k, v in state["found_counts"].items()))
     show("Export", state["export_dir"])
-    if state["rehearsal_ok"] and state["rehearsal_ok"] == state["exported_for"]:
+    if not state["export_dir"]:
+        rehearsal = ""
+    elif state["rehearsal_ok"] and state["rehearsal_ok"] == state["exported_for"]:
         rehearsal = "passed"
     else:
         rehearsal = "not run for the current export"
@@ -1287,6 +1289,21 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
             print("(Docker is not reachable, so Docker objects could not be checked.)")
         return
 
+    keep_export = False
+    if state["export_dir"] and Path(state["export_dir"]).is_dir():
+        print(f"\nThe export folder {state['export_dir']} holds the documents for the production insert.")
+        print("Delete it only after they were inserted into production (or are no longer needed).")
+        choice = questionary.select("What should happen to the export folder?", choices=[
+            questionary.Choice("Keep it and clean up everything else", "keep"),
+            questionary.Choice("Delete it too - already inserted into production or not needed", "delete"),
+            questionary.Choice("Cancel cleanup", "cancel"),
+        ], default="keep").ask()
+        if choice in (None, "cancel"):
+            return
+        keep_export = choice == "keep"
+        if keep_export:
+            folders.remove(state["export_dir"])
+
     print("\nCleanup will permanently remove:")
     for c in containers:
         print(f"  container  {c[:12]}")
@@ -1296,10 +1313,12 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
         print(f"  image      {i}  (pulled by this tool)")
     if state["extract_dir"]:
         print(f"  folder     {state['extract_dir']}")
-    if state["export_dir"]:
+    if state["export_dir"] and not keep_export:
         print(f"  folder     {state['export_dir']}")
-    if STATE_FILE.exists():
+    if STATE_FILE.exists() and not keep_export:
         print(f"  state      {STATE_FILE}")
+    if keep_export:
+        print(f"Kept: {state['export_dir']} and the state file (a later cleanup deletes them).")
     if not docker_ok and (state["container_id"] or state["volume"]
                           or state["rehearsal_container_id"] or state["rehearsal_volume"]):
         print("! Docker is not reachable - Docker objects cannot be removed now. Start Docker and run cleanup again.")
@@ -1314,6 +1333,8 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
             for key in ("container_id", "rehearsal_container_id"):
                 if c == state[key]:
                     state[key] = None
+            if not state["container_id"]:
+                state["restored"] = state["db_verified"] = False
             save_state(state)
     for v in volumes:
         r = docker("volume", "rm", "-f", v, check=False,
@@ -1331,13 +1352,19 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
     save_state(state)
 
     _remove_extract_dir(state)
-    _remove_export_dir(state)
+    if not keep_export:
+        _remove_export_dir(state)
 
-    leftovers = (state["images_pulled"] or state["extract_dir"] or state["export_dir"]
+    leftovers = (state["images_pulled"] or state["extract_dir"] or (state["export_dir"] and not keep_export)
                  or state["container_id"] or state["volume"]
                  or state["rehearsal_container_id"] or state["rehearsal_volume"])
     if leftovers:
         print("! Some items could not be removed - state file kept so cleanup can be retried.")
+        return
+    if keep_export:
+        _verify_cleanup(containers, volumes, images, folders, check_state_file=False)
+        print(f"The export folder {state['export_dir']} and the state file were kept. Run 'Clean up everything'")
+        print("again after the production insert to delete them.")
         return
     if STATE_FILE.exists():
         approve("Delete the tool's state file", f"delete file  {STATE_FILE}")
@@ -1351,7 +1378,7 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
     _verify_cleanup(containers, volumes, images, folders)
 
 
-def _verify_cleanup(containers, volumes, images, folders) -> None:
+def _verify_cleanup(containers, volumes, images, folders, check_state_file: bool = True) -> None:
     """Check that everything cleanup removed is really gone, including untracked labelled leftovers."""
     print("\nVerifying cleanup:")
     problems = []
@@ -1362,7 +1389,7 @@ def _verify_cleanup(containers, volumes, images, folders) -> None:
         + [("no labelled volumes left", not labelled_volumes())]
         + [(f"image {i}", not image_exists(i)) for i in images]
         + [(f"folder {f}", not Path(f).exists()) for f in folders]
-        + [(f"state file {STATE_FILE}", not STATE_FILE.exists())]
+        + ([(f"state file {STATE_FILE}", not STATE_FILE.exists())] if check_state_file else [])
     )
     for what, gone in checks:
         print(f"  {'OK  ' if gone else 'LEFT'}  {what}")
@@ -1370,8 +1397,10 @@ def _verify_cleanup(containers, volumes, images, folders) -> None:
             problems.append(what)
     if problems:
         print(f"! {len(problems)} item(s) still exist - run cleanup again or remove them manually.")
-    else:
+    elif check_state_file:
         print("Cleanup complete - verified that nothing is left behind (the backup archive is kept).")
+    else:
+        print("Verified: every removed item is gone.")
 
 
 # ---------------------------------------------------------------------------
