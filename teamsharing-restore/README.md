@@ -133,16 +133,23 @@ no upsert/overwrite) - copy them in Studio 3T from the local copy
 (`mongodb://127.0.0.1:50000/?directConnection=true`) or import the export
 files. The wizard prints these instructions at the end.
 
-Separate menu entry, run when the recovery is finished:
+## Cleanup - no garbage left
 
-- **Clean up everything** - removes the container, its volume, the image
-  (only if this tool pulled it), the extracted folder, the export folder and
-  the state file. If an export folder exists, it first asks whether to keep
-  it (default - it holds the documents for the production insert), delete
-  it, or cancel. The backup archive itself is never deleted. Removing the
-  container with `-v` also removes the unnamed `/data/configdb` volume the
-  mongo image creates. Afterwards it checks that every removed item is really
-  gone (and that no labelled containers or volumes remain) and prints the result.
+- **Clean up everything** (menu) removes the containers, their volumes, the
+  image (only if this tool pulled it), the extracted folder, the export
+  folder and the state file. If an export folder exists, it first asks
+  whether to keep it (default - it holds the documents for the production
+  insert), delete it, or cancel. The backup archive itself is never deleted.
+  Afterwards it checks that every removed item is really gone (and that no
+  labelled containers or volumes remain) and prints the result.
+- Cleanup is **offered automatically** when the workflow completes and when
+  you exit the menu while anything the tool created still exists.
+- Every Docker object is named and labelled `usefulscripts.teamsharing-restore=1`,
+  including the volume for `/data/configdb` (the mongo image would otherwise
+  create an unnamed, unlabelled volume there that could be left behind), so
+  cleanup finds everything even if the state file is lost.
+- Not removed: the backup archive, Docker images that were already on the
+  machine before the tool ran, and the `questionary` Python package.
 
 ## Restarts
 

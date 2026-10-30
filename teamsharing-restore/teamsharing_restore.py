@@ -83,6 +83,7 @@ LABEL = f"{LABEL_KEY}=1"
 CONTAINER_NAME = "teamsharing-restore"
 VOLUME_NAME = "teamsharing-restore-data"
 DATA_DIR_IN_CONTAINER = "/data/db"
+CONFIG_DIR_IN_CONTAINER = "/data/configdb"   # declared as VOLUME by the mongo image
 EXTRACT_MARKER = ".teamsharing-restore"
 DEFAULT_PORT = 50000
 DEFAULT_MONGO_VERSION = "7.0"
@@ -528,14 +529,37 @@ def _pull_image(state: Dict[str, object], image: str) -> bool:
     return True
 
 
+def _config_volume(data_volume: str) -> str:
+    return f"{data_volume}-config"
+
+
+def _create_volumes(data_volume: str, purpose: str) -> None:
+    """Create the labelled data volume plus a labelled volume for /data/configdb. Without it the
+    mongo image creates an unnamed, unlabelled volume there that cleanup could not find."""
+    docker("volume", "create", "--label", LABEL, data_volume,
+           describe=f"Create Docker volume '{data_volume}' for {purpose}")
+    docker("volume", "create", "--label", LABEL, _config_volume(data_volume),
+           describe=f"Create Docker volume '{_config_volume(data_volume)}' for {CONFIG_DIR_IN_CONTAINER} "
+                    f"(otherwise the mongo image creates an unnamed volume that would be left behind)")
+
+
+def _mount_args(data_volume: str) -> List[str]:
+    return ["-v", f"{data_volume}:{DATA_DIR_IN_CONTAINER}",
+            "-v", f"{_config_volume(data_volume)}:{CONFIG_DIR_IN_CONTAINER}"]
+
+
+def _remove_volumes(data_volume: str, what: str) -> None:
+    docker("volume", "rm", "-f", data_volume, _config_volume(data_volume), check=False,
+           describe=f"Delete {what} ('{data_volume}' and '{_config_volume(data_volume)}')")
+
+
 def _remove_container_and_volume(state: Dict[str, object]) -> None:
     if state["container_id"]:
         docker("rm", "-f", "-v", state["container_id"], check=False,
                describe="Remove the existing container (force-stops it if running)")
         state["container_id"] = None
     if state["volume"]:
-        docker("volume", "rm", "-f", state["volume"], check=False,
-               describe="Delete the container's data volume and the restored data in it")
+        _remove_volumes(state["volume"], "the container's data volumes and the restored data in them")
         state["volume"] = None
     state["restored"] = False
     save_state(state)
@@ -571,13 +595,12 @@ def _create_container(state: Dict[str, object], version: str, port: int) -> bool
         return False
 
     try:
-        docker("volume", "create", "--label", LABEL, VOLUME_NAME,
-               describe=f"Create Docker volume '{VOLUME_NAME}' that will hold the MongoDB data files")
         state["volume"] = VOLUME_NAME
         save_state(state)
+        _create_volumes(VOLUME_NAME, "the MongoDB data files")
         r = docker("create", "--name", CONTAINER_NAME, "--label", LABEL,
                    "-p", f"127.0.0.1:{port}:27017",
-                   "-v", f"{VOLUME_NAME}:{DATA_DIR_IN_CONTAINER}",
+                   *_mount_args(VOLUME_NAME),
                    image,
                    describe=f"Create container '{CONTAINER_NAME}' from {image}: MongoDB port 27017 published "
                             f"on 127.0.0.1:{port} only, data volume mounted at {DATA_DIR_IN_CONTAINER}")
@@ -665,7 +688,7 @@ def _load_backup(state: Dict[str, object]) -> bool:
     if info["State"]["Running"]:
         docker("stop", cid, describe="Stop the container so mongod releases the data files")
     if started_before:
-        docker("run", "--rm", "--label", LABEL, "-v", f"{state['volume']}:{DATA_DIR_IN_CONTAINER}",
+        docker("run", "--rm", "--label", LABEL, *_mount_args(state["volume"]),
                "--entrypoint", "sh", state["image"], "-c", f"find {DATA_DIR_IN_CONTAINER} -mindepth 1 -delete",
                describe=f"Empty the data volume '{state['volume']}' (it holds data from an earlier start) "
                         f"using a temporary helper container, removed automatically when done")
@@ -1057,8 +1080,7 @@ def _remove_rehearsal(state: Dict[str, object]) -> None:
                describe="Remove the rehearsal container")
         state["rehearsal_container_id"] = None
     if state["rehearsal_volume"]:
-        docker("volume", "rm", "-f", state["rehearsal_volume"], check=False,
-               describe="Delete the rehearsal data volume")
+        _remove_volumes(state["rehearsal_volume"], "the rehearsal data volumes")
         state["rehearsal_volume"] = None
     save_state(state)
 
@@ -1069,11 +1091,10 @@ def _start_rehearsal_container(state: Dict[str, object]) -> Optional[str]:
     if container_info(name) and not state["rehearsal_container_id"]:
         print(f"A container named '{name}' exists but is not tracked. Run cleanup first.")
         return None
-    docker("volume", "create", "--label", LABEL, volume,
-           describe=f"Create Docker volume '{volume}' for the rehearsal copy of the backup")
     state["rehearsal_volume"] = volume
     save_state(state)
-    r = docker("create", "--name", name, "--label", LABEL, "-v", f"{volume}:{DATA_DIR_IN_CONTAINER}",
+    _create_volumes(volume, "the rehearsal copy of the backup")
+    r = docker("create", "--name", name, "--label", LABEL, *_mount_args(volume),
                state["image"],
                describe=f"Create rehearsal container '{name}' from {state['image']} (same version as the "
                         f"restore). No port is published: it is only reachable through docker exec")
@@ -1279,7 +1300,11 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
     containers = set(labelled_containers()) if docker_ok else set()
     containers.update(c for c in (state["container_id"], state["rehearsal_container_id"]) if c)
     volumes = set(labelled_volumes()) if docker_ok else set()
-    volumes.update(v for v in (state["volume"], state["rehearsal_volume"]) if v)
+    for v in (state["volume"], state["rehearsal_volume"]):
+        if v:
+            volumes.add(v)
+            if docker_ok and volume_exists(_config_volume(v)):
+                volumes.add(_config_volume(v))
     images = [i for i in state["images_pulled"] if docker_ok and image_exists(i)]
     folders = [f for f in (state["extract_dir"], state["export_dir"]) if f]
 
@@ -1338,7 +1363,7 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
             save_state(state)
     for v in volumes:
         r = docker("volume", "rm", "-f", v, check=False,
-                   describe="Delete the data volume and the restored database files in it")
+                   describe=f"Delete the volume '{v}' and the database files in it")
         print(f"Removed volume {v}" if r.returncode == 0 else f"! Could not remove volume {v}: {r.stderr.strip()}")
         if r.returncode == 0:
             for key in ("volume", "rehearsal_volume"):
@@ -1483,6 +1508,40 @@ def run_step(step: Step, state: Dict[str, object]) -> bool:
     return True
 
 
+def leftovers(state: Dict[str, object], docker_ok: bool) -> List[str]:
+    """Everything this tool created that still exists."""
+    items = []
+    if docker_ok:
+        items += [f"container {c[:12]}" for c in labelled_containers()]
+        items += [f"volume    {v}" for v in labelled_volumes()]
+        items += [f"image     {i}" for i in state["images_pulled"] if image_exists(i)]
+    items += [f"folder    {f}" for f in (state["extract_dir"], state["export_dir"]) if f and Path(f).is_dir()]
+    if STATE_FILE.exists():
+        items.append(f"state     {STATE_FILE}")
+    return items
+
+
+def offer_cleanup(state: Dict[str, object], docker_ok: bool, reason: str) -> None:
+    """Ask to clean up whenever the tool is about to leave something behind."""
+    items = leftovers(state, docker_ok)
+    if not items:
+        return
+    print(f"\n{reason} These still exist on this computer:")
+    for item in items:
+        print(f"  {item}")
+    if not questionary.confirm("Clean up now? (you can keep the export folder in the next question)",
+                               default=True).ask():
+        print("Kept. Run the tool again and choose 'Clean up everything' to remove them later.")
+        return
+    reset_approvals()
+    try:
+        cleanup(state, docker_ok)
+    except StepCancelled as e:
+        print(f"\nCancelled at: {e}. Nothing further was run.")
+    except DockerError as e:
+        print(f"! {e}")
+
+
 def run_wizard(state: Dict[str, object], docker_ok: bool) -> None:
     """Walk the user through the remaining steps in order until done or they stop."""
     while True:
@@ -1490,6 +1549,7 @@ def run_wizard(state: Dict[str, object], docker_ok: bool) -> None:
         if index is None:
             print("\nAll automated steps are done.")
             print_production_instructions(state)
+            offer_cleanup(state, docker_ok, "The workflow is complete.")
             return
         step = STEPS[index]
         _print_progress(state, index)
@@ -1553,6 +1613,7 @@ def run_menu() -> None:
         ]
         action = questionary.select("What do you want to do?", choices=choices, default=wizard_choice).ask()
         if action in (None, "exit"):
+            offer_cleanup(state, docker_ok, "Before you exit:")
             return
         try:
             if action == "wizard":
@@ -1578,7 +1639,8 @@ def main() -> int:
     try:
         run_menu()
     except KeyboardInterrupt:
-        print("\nInterrupted - state is saved, run the tool again to continue.")
+        print("\nInterrupted - state is saved. Run the tool again to continue, or choose 'Clean up everything'")
+        print("to remove everything it created.")
     return 0
 
 
