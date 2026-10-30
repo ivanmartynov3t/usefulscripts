@@ -102,11 +102,36 @@ Workflow steps, in order:
     still mention the old ID inside a longer value are flagged for review.
     With **Same ID** nothing is replaced: the documents are exported as they
     are in the backup and the local copy is not modified.
+7. **Rehearse the production restore** - a model of the production insert
+   in a second container (same MongoDB version, same backup, **no port
+   published**, ~1 GB extra disk) that plays "production":
+   1. runs the runbook queries on its own copy of the backup and applies
+      the same ID fix, giving the **expected** documents - independent of
+      the export
+   2. deletes those documents (simulating the erroneous deletion)
+   3. inserts the export files in production order, insert only
+   4. compares every stored document with the expected one and every
+      collection count with the backup
+
+   It fails if the export misses a document, holds an extra one, or any
+   document differs from the backup:
+
+   ```
+   Collection                                  expected export deleted inserted identical total before total after
+   ENCRYPTION_PROD.__keyVault                         1      1       1        1         1            1           1
+   TEAM_SHARING_ENCRYPTED_PROD.resource              51     51      51       51        51        12614       12614
+   ...
+   Rehearsal passed: ...
+   ```
+
+   The rehearsal container can be removed right away; cleanup removes it
+   too.
 
 The production insert itself stays manual, as in the runbook: with
-production access, insert the documents in the order above - copy them in
-Studio 3T from the local copy (`mongodb://127.0.0.1:50000/?directConnection=true`)
-or import the export files. The wizard prints these instructions at the end.
+production access, insert the documents in the order above (insert only,
+no upsert/overwrite) - copy them in Studio 3T from the local copy
+(`mongodb://127.0.0.1:50000/?directConnection=true`) or import the export
+files. The wizard prints these instructions at the end.
 
 Separate menu entry, run when the recovery is finished:
 

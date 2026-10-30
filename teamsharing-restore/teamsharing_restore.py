@@ -24,6 +24,10 @@ local mongod binary:
   6. Replace the old user ID with the new one (local copy only; skipped for
      "Same ID") and export the documents as Extended JSON in production
      insert order
+  7. Rehearse the production restore in a second container (same version,
+     same backup, no port): derive the expected documents from the backup,
+     delete them, insert the export in production order and compare every
+     document and collection count with the backup
   Inserting into production stays manual. "Clean up everything" removes the
   container, volume, pulled image, extracted files, export and state; the
   backup archive itself is never deleted.
@@ -137,6 +141,9 @@ def _empty_state() -> Dict[str, object]:
         "found_counts": None,      # documents found per collection for old_user_id
         "export_dir": None,        # folder this tool created for the fixed documents
         "exported_for": None,      # [old_user_id, new_user_id] the export was made for
+        "rehearsal_container_id": None,  # second container used to rehearse the production insert
+        "rehearsal_volume": None,
+        "rehearsal_ok": None,      # exported_for value of the export that passed the rehearsal
         "updated": None,
     }
 
@@ -305,7 +312,13 @@ def reconcile(state: Dict[str, object], docker_ok: bool) -> None:
             state["volume"] = None
             state["restored"] = False
             changed = True
-        known = set(filter(None, [state["container_id"]]))
+        if state["rehearsal_container_id"] and not container_info(state["rehearsal_container_id"]):
+            state["rehearsal_container_id"] = None
+            changed = True
+        if state["rehearsal_volume"] and not volume_exists(state["rehearsal_volume"]):
+            state["rehearsal_volume"] = None
+            changed = True
+        known = set(filter(None, [state["container_id"], state["rehearsal_container_id"]]))
         orphans = [c for c in labelled_containers() if c not in known]
         if orphans:
             print(f"- {len(orphans)} labelled container(s) not tracked in state - cleanup will remove them.")
@@ -338,6 +351,13 @@ def print_status(state: Dict[str, object], docker_ok: bool) -> None:
     if state["found_counts"]:
         show("Found", ", ".join(f"{k.split('.')[-1]}: {v}" for k, v in state["found_counts"].items()))
     show("Export", state["export_dir"])
+    if state["rehearsal_ok"] and state["rehearsal_ok"] == state["exported_for"]:
+        rehearsal = "passed"
+    else:
+        rehearsal = "not run for the current export"
+    if state["rehearsal_container_id"]:
+        rehearsal += f" (rehearsal container {state['rehearsal_container_id'][:12]} still exists)"
+    show("Rehearsal", rehearsal)
     print(f"  (state file: {STATE_FILE})\n")
 
 
@@ -970,16 +990,21 @@ def fix_and_export(state: Dict[str, object]) -> None:
     save_state(state)
 
 
+# mongosh code defining fix(): replaces every value equal to OLD with NEW (in place), skipping BSON types
+FIX_OWNERSHIP_JS = (
+    "const isPlain = v => v !== null && typeof v === 'object' && !v._bsontype\n"
+    "  && Object.prototype.toString.call(v) === '[object Object]';\n"
+    "const fix = v => {\n"
+    "  if (v === OLD) return NEW;\n"
+    "  if (Array.isArray(v)) return v.map(fix);\n"
+    "  if (isPlain(v)) { for (const k of Object.keys(v)) v[k] = fix(v[k]); }\n"
+    "  return v;\n"
+    "};\n"
+)
+
+
 def _run_fix_ownership(state: Dict[str, object]) -> Optional[object]:
-    return _run_json(state, _find_documents_js(state) + (
-        "const isPlain = v => v !== null && typeof v === 'object' && !v._bsontype\n"
-        "  && Object.prototype.toString.call(v) === '[object Object]';\n"
-        "const fix = v => {\n"
-        "  if (v === OLD) return NEW;\n"
-        "  if (Array.isArray(v)) return v.map(fix);\n"
-        "  if (isPlain(v)) { for (const k of Object.keys(v)) v[k] = fix(v[k]); }\n"
-        "  return v;\n"
-        "};\n"
+    return _run_json(state, _find_documents_js(state) + FIX_OWNERSHIP_JS + (
         "const leftovers = {};\n"
         "for (const [name, docs] of Object.entries(found)) {\n"
         "  const [dbName, ...rest] = name.split('.');\n"
@@ -1001,8 +1026,213 @@ def print_production_instructions(state: Dict[str, object]) -> None:
     print(f"     {state['export_dir']} (Import > JSON):")
     for i, name in enumerate(EXPORT_ORDER, 1):
         print(f"       {i}. {name}")
-    print("  3. Double-check the target database for every collection before inserting.")
-    print("  4. When done, run 'Clean up everything' - it also deletes the export folder.")
+    print("  3. Insert only - do not upsert or overwrite: documents that still exist in production are")
+    print("     then rejected as duplicates instead of replacing live data.")
+    print("  4. Double-check the target database for every collection before inserting.")
+    print("  5. When done, run 'Clean up everything' - it also deletes the export folder.")
+    if state["rehearsal_ok"] and state["rehearsal_ok"] == state["exported_for"]:
+        print("  (This export passed the restore rehearsal.)")
+
+
+# ---------------------------------------------------------------------------
+# Restore rehearsal: a second container plays "production" - the backup is
+# loaded, the exported documents are deleted (simulating the erroneous
+# deletion), the export files are inserted in production order and the
+# result is compared document by document.
+# ---------------------------------------------------------------------------
+
+REHEARSAL_EXPORT_DIR = "/tmp/rehearsal-export"
+REHEARSAL_EXPECTED_FILE = "/tmp/rehearsal-expected.json"
+
+
+def _rehearsal_names() -> Tuple[str, str]:
+    return f"{CONTAINER_NAME}-rehearsal", f"{VOLUME_NAME}-rehearsal"
+
+
+def _remove_rehearsal(state: Dict[str, object]) -> None:
+    if state["rehearsal_container_id"]:
+        docker("rm", "-f", "-v", state["rehearsal_container_id"], check=False,
+               describe="Remove the rehearsal container")
+        state["rehearsal_container_id"] = None
+    if state["rehearsal_volume"]:
+        docker("volume", "rm", "-f", state["rehearsal_volume"], check=False,
+               describe="Delete the rehearsal data volume")
+        state["rehearsal_volume"] = None
+    save_state(state)
+
+
+def _start_rehearsal_container(state: Dict[str, object]) -> Optional[str]:
+    """Second container, same image, loaded with the same extracted backup. No port is published."""
+    name, volume = _rehearsal_names()
+    if container_info(name) and not state["rehearsal_container_id"]:
+        print(f"A container named '{name}' exists but is not tracked. Run cleanup first.")
+        return None
+    docker("volume", "create", "--label", LABEL, volume,
+           describe=f"Create Docker volume '{volume}' for the rehearsal copy of the backup")
+    state["rehearsal_volume"] = volume
+    save_state(state)
+    r = docker("create", "--name", name, "--label", LABEL, "-v", f"{volume}:{DATA_DIR_IN_CONTAINER}",
+               state["image"],
+               describe=f"Create rehearsal container '{name}' from {state['image']} (same version as the "
+                        f"restore). No port is published: it is only reachable through docker exec")
+    cid = r.stdout.strip()
+    state["rehearsal_container_id"] = cid
+    save_state(state)
+    docker("cp", str(Path(state["dbpath"])) + os.sep + ".", f"{cid}:{DATA_DIR_IN_CONTAINER}",
+           describe="Copy the same extracted backup into the rehearsal container (plays 'production')")
+    docker("start", cid, describe="Start MongoDB in the rehearsal container")
+    return cid if _wait_ready(cid) else None
+
+
+def _export_files_js() -> str:
+    """mongosh code that loads every export file into `files` (name -> array of BSON documents)."""
+    entries = ",\n".join(f"  {json.dumps(name)}: {json.dumps(f'{i}-{name}.json')}"
+                         for i, name in enumerate(EXPORT_ORDER, 1))
+    return (
+        "const fs = require('fs');\n"
+        f"const DIR = {json.dumps(REHEARSAL_EXPORT_DIR)};\n"
+        f"const FILE_NAMES = {{\n{entries}\n}};\n"
+        "const files = {};\n"
+        "for (const [name, file] of Object.entries(FILE_NAMES)) {\n"
+        "  files[name] = EJSON.parse(fs.readFileSync(DIR + '/' + file, 'utf8'), {relaxed: false});\n"
+        "}\n"
+        "const collOf = name => { const [d, ...rest] = name.split('.'); "
+        "return db.getSiblingDB(d).getCollection(rest.join('.')); };\n"
+    )
+
+
+def rehearse_restore(state: Dict[str, object]) -> None:
+    if not _restored_db_ready(state):
+        return
+    if not (state["export_dir"] and state["exported_for"] == [state["old_user_id"], state["new_user_id"]]):
+        print("Export the documents first.")
+        return
+    print("Plan: start a second container from the same backup, delete the exported documents in it")
+    print("(simulating the erroneous deletion), insert the export files in production order, then")
+    print("compare every document. Your restored copy and production are not touched.")
+
+    if state["rehearsal_container_id"] or state["rehearsal_volume"]:
+        print("A previous rehearsal container exists - it is replaced by a fresh one.")
+        _remove_rehearsal(state)
+    state["rehearsal_ok"] = None
+    save_state(state)
+    cid = _start_rehearsal_container(state)
+    if not cid:
+        return
+    docker("cp", str(Path(state["export_dir"])) + os.sep + ".", f"{cid}:{REHEARSAL_EXPORT_DIR}",
+           describe=f"Copy the export files into the rehearsal container ({REHEARSAL_EXPORT_DIR})")
+
+    def run(script: str, describe: str) -> Optional[Dict[str, object]]:
+        r = mongosh(cid, script, describe=describe)
+        if r.returncode != 0:
+            print(f"Query failed: {(r.stderr or r.stdout).strip()[:1000]}")
+            return None
+        try:
+            return json.loads(r.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            print(f"Unexpected output: {r.stdout.strip()[:500]}")
+            return None
+
+    # 1) Independently of the export: run the runbook queries on the rehearsal's own copy of the backup,
+    #    apply the same ID fix -> the documents production should end up with. Then delete them.
+    deleted = run(_find_documents_js(state) + FIX_OWNERSHIP_JS + _export_files_js() + (
+        "const key = id => EJSON.stringify(id, {relaxed: false});\n"
+        "const expected = {}; const out = {};\n"
+        "for (const name of Object.keys(found)) {\n"
+        "  expected[name] = found[name].map(d => fix(d));\n"
+        "  const expIds = new Set(expected[name].map(d => key(d._id)));\n"
+        "  const fileIds = new Set(files[name].map(d => key(d._id)));\n"
+        "  out[name] = {expected: expected[name].length, inExport: files[name].length,\n"
+        "    notInExport: [...expIds].filter(k => !fileIds.has(k)).length,\n"
+        "    extraInExport: [...fileIds].filter(k => !expIds.has(k)).length};\n"
+        "}\n"
+        f"fs.writeFileSync({json.dumps(REHEARSAL_EXPECTED_FILE)}, EJSON.stringify(expected, {{relaxed: false}}));\n"
+        "for (const name of Object.keys(expected).reverse()) {\n"
+        "  const coll = collOf(name); const ids = expected[name].map(d => d._id);\n"
+        "  out[name].before = coll.countDocuments();\n"
+        "  out[name].deleted = coll.deleteMany({_id: {$in: ids}}).deletedCount;\n"
+        "  out[name].stillThere = coll.countDocuments({_id: {$in: ids}});\n"
+        "}\n"
+        "print(JSON.stringify(out));\n"
+    ), "WRITE to the REHEARSAL container only: run the runbook queries on its own copy of the backup, "
+       "apply the same ID fix to get the EXPECTED documents (saved for the comparison), then delete them "
+       "to simulate the erroneous deletion")
+    if deleted is None:
+        return
+
+    inserted = run(_export_files_js() + (
+        "const out = {};\n"
+        "for (const [name, docs] of Object.entries(files)) {\n"
+        "  let ok = 0, failed = 0;\n"
+        "  if (docs.length) {\n"
+        "    try { ok = Object.keys(collOf(name).insertMany(docs, {ordered: false}).insertedIds).length; }\n"
+        "    catch (e) { failed = (e.writeErrors || []).length || docs.length;\n"
+        "                ok = (e.result && e.result.insertedCount) || docs.length - failed; }\n"
+        "  }\n"
+        "  out[name] = {inserted: ok, failed: failed};\n"
+        "}\n"
+        "print(JSON.stringify(out));\n"
+    ), "WRITE to the REHEARSAL container only: insert the export files in production order "
+       "(insert only, like the Studio 3T import)")
+    if inserted is None:
+        return
+
+    # 3) Compare what is stored now with the EXPECTED documents derived from the backup (not with the
+    #    export itself), so a wrong or incomplete export is caught.
+    verified = run((
+        f"const expected = EJSON.parse(require('fs').readFileSync({json.dumps(REHEARSAL_EXPECTED_FILE)}, 'utf8'),"
+        " {relaxed: false});\n"
+        "const out = {};\n"
+        "for (const [name, docs] of Object.entries(expected)) {\n"
+        "  const [d, ...rest] = name.split('.'); const coll = db.getSiblingDB(d).getCollection(rest.join('.'));\n"
+        "  let identical = 0, different = 0, missing = 0;\n"
+        "  for (const e of docs) {\n"
+        "    const got = coll.findOne({_id: e._id});\n"
+        "    if (!got) missing++;\n"
+        "    else if (EJSON.stringify(got, {relaxed: false}) === EJSON.stringify(e, {relaxed: false})) identical++;\n"
+        "    else different++;\n"
+        "  }\n"
+        "  out[name] = {identical: identical, different: different, missing: missing, after: coll.countDocuments()};\n"
+        "}\n"
+        "print(JSON.stringify(out));\n"
+    ), "Read-only query on the REHEARSAL container: compare every stored document with the EXPECTED "
+       "document from the backup, and count each collection")
+    if verified is None:
+        return
+
+    print(f"\n{'Collection':<46} {'expected':>8} {'export':>7} {'deleted':>8} {'inserted':>9} {'identical':>10} "
+          f"{'total before':>13} {'total after':>12}")
+    problems = []
+    for name in EXPORT_ORDER:
+        d, i, v = deleted[name], inserted[name], verified[name]
+        print(f"{name:<46} {d['expected']:>8} {d['inExport']:>7} {d['deleted']:>8} {i['inserted']:>9} "
+              f"{v['identical']:>10} {d['before']:>13} {v['after']:>12}")
+        if d["notInExport"]:
+            problems.append(f"{name}: {d['notInExport']} expected document(s) are missing from the export")
+        if d["extraInExport"]:
+            problems.append(f"{name}: the export holds {d['extraInExport']} document(s) that are not expected")
+        if d["stillThere"]:
+            problems.append(f"{name}: {d['stillThere']} document(s) could not be deleted")
+        if i["failed"]:
+            problems.append(f"{name}: {i['failed']} insert(s) failed")
+        if v["missing"] or v["different"]:
+            problems.append(f"{name}: {v['missing']} missing, {v['different']} differ from the backup after insert")
+        if v["after"] != d["before"]:
+            problems.append(f"{name}: collection has {v['after']} documents, backup had {d['before']}")
+
+    if problems:
+        print("\nRehearsal FAILED:")
+        for p in problems:
+            print(f"  ! {p}")
+    else:
+        print("\nRehearsal passed: the export holds exactly the documents the runbook queries find in the backup;")
+        print("after deleting them and inserting the export in production order, every document is identical")
+        print("to the backup (with the ID fix applied) and every collection has as many documents as before.")
+        state["rehearsal_ok"] = list(state["exported_for"])
+        save_state(state)
+
+    if questionary.confirm("Remove the rehearsal container now? (cleanup also removes it)", default=True).ask():
+        _remove_rehearsal(state)
 
 
 # ---------------------------------------------------------------------------
@@ -1045,11 +1275,9 @@ def _remove_export_dir(state: Dict[str, object]) -> None:
 
 def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
     containers = set(labelled_containers()) if docker_ok else set()
-    if state["container_id"]:
-        containers.add(state["container_id"])
+    containers.update(c for c in (state["container_id"], state["rehearsal_container_id"]) if c)
     volumes = set(labelled_volumes()) if docker_ok else set()
-    if state["volume"]:
-        volumes.add(state["volume"])
+    volumes.update(v for v in (state["volume"], state["rehearsal_volume"]) if v)
     images = [i for i in state["images_pulled"] if docker_ok and image_exists(i)]
     folders = [f for f in (state["extract_dir"], state["export_dir"]) if f]
 
@@ -1072,7 +1300,8 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
         print(f"  folder     {state['export_dir']}")
     if STATE_FILE.exists():
         print(f"  state      {STATE_FILE}")
-    if not docker_ok and (state["container_id"] or state["volume"]):
+    if not docker_ok and (state["container_id"] or state["volume"]
+                          or state["rehearsal_container_id"] or state["rehearsal_volume"]):
         print("! Docker is not reachable - Docker objects cannot be removed now. Start Docker and run cleanup again.")
         return
     if not questionary.confirm("Proceed? This cannot be undone.", default=False).ask():
@@ -1081,15 +1310,19 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
     for c in containers:
         r = docker("rm", "-f", "-v", c, check=False, describe="Remove the container (force-stops it if running)")
         print(f"Removed container {c[:12]}" if r.returncode == 0 else f"! Could not remove container {c[:12]}")
-        if c == state["container_id"] and r.returncode == 0:
-            state["container_id"] = None
+        if r.returncode == 0:
+            for key in ("container_id", "rehearsal_container_id"):
+                if c == state[key]:
+                    state[key] = None
             save_state(state)
     for v in volumes:
         r = docker("volume", "rm", "-f", v, check=False,
                    describe="Delete the data volume and the restored database files in it")
         print(f"Removed volume {v}" if r.returncode == 0 else f"! Could not remove volume {v}: {r.stderr.strip()}")
-        if v == state["volume"] and r.returncode == 0:
-            state["volume"] = None
+        if r.returncode == 0:
+            for key in ("volume", "rehearsal_volume"):
+                if v == state[key]:
+                    state[key] = None
             save_state(state)
     for i in images:
         r = docker("rmi", i, check=False, describe=f"Delete the Docker image {i} (downloaded by this tool)")
@@ -1101,7 +1334,8 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
     _remove_export_dir(state)
 
     leftovers = (state["images_pulled"] or state["extract_dir"] or state["export_dir"]
-                 or state["container_id"] or state["volume"])
+                 or state["container_id"] or state["volume"]
+                 or state["rehearsal_container_id"] or state["rehearsal_volume"])
     if leftovers:
         print("! Some items could not be removed - state file kept so cleanup can be retried.")
         return
@@ -1185,6 +1419,12 @@ STEPS = [
          lambda s: bool(s["export_dir"] and s["exported_for"] == [s["old_user_id"], s["new_user_id"]]),
          "Replaces the old user ID with the new one in the found documents (local copy only; skipped\n"
          "for 'Same ID') and writes them as JSON files, numbered in production insert order."),
+    Step("rehearse", "Rehearse the production restore", True, rehearse_restore,
+         lambda s: bool(s["rehearsal_ok"] and s["rehearsal_ok"] == s["exported_for"]),
+         "Starts a second container (same MongoDB version, same backup, no port) that plays\n"
+         "'production': deletes the exported documents to simulate the erroneous deletion, inserts\n"
+         "the export files in production order (insert only), then checks every document is back and\n"
+         "identical and every collection count matches the backup. Needs ~1 GB extra disk space."),
 ]
 
 
