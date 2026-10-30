@@ -47,7 +47,7 @@ import tarfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, NamedTuple, Optional
 
 try:
     import questionary
@@ -105,6 +105,7 @@ def _empty_state() -> Dict[str, object]:
         "container_id": None,
         "volume": None,
         "restored": False,
+        "db_verified": False,      # last database check found all runbook collections
         "updated": None,
     }
 
@@ -512,6 +513,8 @@ def restore_data(state: Dict[str, object]) -> None:
         return
 
     cid = state["container_id"]
+    state["restored"] = state["db_verified"] = False
+    save_state(state)
     try:
         print("Stopping container ...")
         docker("stop", cid)
@@ -575,6 +578,8 @@ def verify_databases(state: Dict[str, object]) -> None:
                 print(f"  MISSING  {db_name}.{col}")
                 all_ok = False
     print("\nAll expected collections present." if all_ok else "\nSome expected collections are missing.")
+    state["db_verified"] = all_ok
+    save_state(state)
     print(f"Connect Studio 3T to mongodb://127.0.0.1:{state['port']}/?directConnection=true")
 
 
@@ -662,8 +667,77 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Menu
+# Wizard + menu
 # ---------------------------------------------------------------------------
+
+class Step(NamedTuple):
+    key: str
+    title: str
+    needs_docker: bool
+    run: Callable[[Dict[str, object]], object]
+    is_done: Callable[[Dict[str, object]], bool]
+
+
+STEPS = [
+    Step("archive", "Select backup archive (.tar.gz)", False, select_archive,
+         lambda s: bool(s["archive"])),
+    Step("workdir", "Select working folder", False, select_workdir,
+         lambda s: bool(s["workdir"])),
+    Step("extract", "Extract archive", False, extract_archive,
+         lambda s: bool(s["dbpath"])),
+    Step("create", "Create MongoDB container", True, create_container,
+         lambda s: bool(s["container_id"])),
+    Step("verify", "Verify container is running", True, verify_container,
+         lambda s: bool(s["container_id"]) and container_running(s["container_id"])),
+    Step("restore", "Restore data into container", True, restore_data,
+         lambda s: bool(s["restored"])),
+    Step("verify_db", "Verify databases", True, verify_databases,
+         lambda s: bool(s["restored"] and s["db_verified"])),
+]
+
+
+def next_step(state: Dict[str, object]) -> Optional[int]:
+    """Index of the first step that isn't done yet, or None when the workflow is complete."""
+    for i, step in enumerate(STEPS):
+        if not step.is_done(state):
+            return i
+    return None
+
+
+def _print_progress(state: Dict[str, object], current: Optional[int]) -> None:
+    print("\nWorkflow")
+    for i, step in enumerate(STEPS):
+        mark = "[x]" if step.is_done(state) else ("[>]" if i == current else "[ ]")
+        print(f"  {mark} {i + 1}. {step.title}")
+
+
+def run_wizard(state: Dict[str, object], docker_ok: bool) -> None:
+    """Walk the user through the remaining steps in order until done or they stop."""
+    while True:
+        index = next_step(state)
+        if index is None:
+            print("\nAll steps are done. Open Studio 3T on "
+                  f"mongodb://127.0.0.1:{state['port']}/?directConnection=true and follow the runbook.")
+            print("When the recovery is finished, run 'Clean up everything' from the menu.")
+            return
+        step = STEPS[index]
+        _print_progress(state, index)
+        if step.needs_docker and not docker_ok:
+            print(f"\nStep {index + 1} needs Docker, which is not reachable. Start Docker Desktop, "
+                  f"then choose 'Re-check Docker' in the menu.")
+            return
+        print(f"\n=== Step {index + 1} of {len(STEPS)}: {step.title} ===")
+        step.run(state)
+        if step.is_done(state):
+            following = next_step(state)
+            if following is None:
+                continue
+            if not questionary.confirm(f"Continue with step {following + 1}: {STEPS[following].title}?",
+                                       default=True).ask():
+                return
+        elif not questionary.confirm(f"Step {index + 1} is not complete. Try it again?", default=True).ask():
+            return
+
 
 def run_menu() -> None:
     state = load_state()
@@ -672,45 +746,51 @@ def run_menu() -> None:
         print(f"! {docker_error}")
     reconcile(state, docker_error is None)
 
+    index = next_step(state)
+    if index is not None:
+        verb = "Start" if index == 0 else "Resume"
+        if questionary.confirm(f"{verb} the guided workflow at step {index + 1}: {STEPS[index].title}?",
+                               default=True).ask():
+            try:
+                run_wizard(state, docker_error is None)
+            except DockerError as e:
+                print(f"! {e}")
+
     while True:
         docker_ok = docker_error is None
         print_status(state, docker_ok)
-        choices = [
-            questionary.Choice("1. Select backup archive (.tar.gz)", "archive"),
-            questionary.Choice("2. Select working folder", "workdir"),
-            questionary.Choice("3. Extract archive", "extract"),
-            questionary.Choice("4. Create MongoDB container", "create", disabled=None if docker_ok else "Docker unavailable"),
-            questionary.Choice("5. Verify container is running", "verify", disabled=None if docker_ok else "Docker unavailable"),
-            questionary.Choice("6. Restore data into container", "restore", disabled=None if docker_ok else "Docker unavailable"),
-            questionary.Choice("7. Verify databases", "verify_db", disabled=None if docker_ok else "Docker unavailable"),
-            questionary.Choice("8. Clean up everything", "cleanup"),
+        index = next_step(state)
+        _print_progress(state, index)
+        if index is None:
+            wizard_choice = questionary.Choice("> Workflow complete - show connection details", "wizard")
+        else:
+            wizard_choice = questionary.Choice(f"> Continue guided workflow (step {index + 1}: {STEPS[index].title})",
+                                               "wizard")
+        choices = [wizard_choice, questionary.Separator("-- Run a single step --")]
+        for i, step in enumerate(STEPS):
+            mark = "[x]" if step.is_done(state) else "[ ]"
+            disabled = "Docker unavailable" if step.needs_docker and not docker_ok else None
+            choices.append(questionary.Choice(f"{mark} {i + 1}. {step.title}", step.key, disabled=disabled))
+        choices += [
+            questionary.Separator("-- Other --"),
+            questionary.Choice("Clean up everything", "cleanup"),
             questionary.Choice("Re-check Docker", "recheck"),
             questionary.Choice("Exit", "exit"),
         ]
-        action = questionary.select("What do you want to do?", choices=choices).ask()
+        action = questionary.select("What do you want to do?", choices=choices, default=wizard_choice).ask()
         if action in (None, "exit"):
             return
         try:
-            if action == "archive":
-                select_archive(state)
-            elif action == "workdir":
-                select_workdir(state)
-            elif action == "extract":
-                extract_archive(state)
-            elif action == "create":
-                create_container(state)
-            elif action == "verify":
-                verify_container(state)
-            elif action == "restore":
-                restore_data(state)
-            elif action == "verify_db":
-                verify_databases(state)
+            if action == "wizard":
+                run_wizard(state, docker_ok)
             elif action == "cleanup":
                 cleanup(state, docker_ok)
             elif action == "recheck":
                 docker_error = docker_available()
                 print(f"! {docker_error}" if docker_error else "Docker is available.")
                 reconcile(state, docker_error is None)
+            else:
+                next(s for s in STEPS if s.key == action).run(state)
         except DockerError as e:
             print(f"! {e}")
 

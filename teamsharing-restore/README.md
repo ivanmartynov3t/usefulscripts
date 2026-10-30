@@ -25,7 +25,14 @@ pip install questionary
 python teamsharing_restore.py
 ```
 
-Menu steps, in order:
+The tool works as a **guided wizard**: on start it offers to begin (or
+resume) the workflow at the first unfinished step, runs it, and asks before
+moving on to the next one. You can stop at any point; the menu that follows
+shows progress (`[x]` done, `[ ]` open), keeps "Continue guided workflow"
+as the default choice, and still lets you run any single step again (e.g.
+recreate the container with another MongoDB version).
+
+Workflow steps, in order:
 
 1. **Select backup archive** - the `.tar.gz` / `.tgz` snapshot downloaded from Atlas
 2. **Select working folder** - the archive is extracted into a new
@@ -43,9 +50,12 @@ Menu steps, in order:
    document counts of the collections the runbook needs
    (`TEAM_SHARING_ENCRYPTED_PROD.{user,folder,resource,resourceContent,permission}`,
    `ENCRYPTION_PROD.__keyVault`)
-8. **Clean up everything** - removes the container, its volume, the image
-   (only if this tool pulled it), the extracted folder and the state file.
-   Deleting the original archive is offered separately (default: no)
+
+Separate menu entry, run when the recovery is finished:
+
+- **Clean up everything** - removes the container, its volume, the image
+  (only if this tool pulled it), the extracted folder and the state file.
+  Deleting the original archive is offered separately (default: no)
 
 Then connect Studio 3T to `mongodb://127.0.0.1:50000/?directConnection=true`
 and follow the runbook from *"Find the affected user, folder and resources"*.
