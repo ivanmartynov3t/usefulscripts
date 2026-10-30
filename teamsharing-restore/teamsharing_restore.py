@@ -1053,6 +1053,12 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
     images = [i for i in state["images_pulled"] if docker_ok and image_exists(i)]
     folders = [f for f in (state["extract_dir"], state["export_dir"]) if f]
 
+    if not (containers or volumes or images or folders or STATE_FILE.exists()):
+        print("\nNothing to clean up: no containers, volumes, images, folders or state file from this tool exist.")
+        if not docker_ok:
+            print("(Docker is not reachable, so Docker objects could not be checked.)")
+        return
+
     print("\nCleanup will permanently remove:")
     for c in containers:
         print(f"  container  {c[:12]}")
@@ -1064,7 +1070,8 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
         print(f"  folder     {state['extract_dir']}")
     if state["export_dir"]:
         print(f"  folder     {state['export_dir']}")
-    print(f"  state      {STATE_FILE}")
+    if STATE_FILE.exists():
+        print(f"  state      {STATE_FILE}")
     if not docker_ok and (state["container_id"] or state["volume"]):
         print("! Docker is not reachable - Docker objects cannot be removed now. Start Docker and run cleanup again.")
         return
@@ -1098,8 +1105,9 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
     if leftovers:
         print("! Some items could not be removed - state file kept so cleanup can be retried.")
         return
-    approve("Delete the tool's state file", f"delete file  {STATE_FILE}")
-    STATE_FILE.unlink(missing_ok=True)
+    if STATE_FILE.exists():
+        approve("Delete the tool's state file", f"delete file  {STATE_FILE}")
+        STATE_FILE.unlink()
     try:
         STATE_FILE.parent.rmdir()
     except OSError:
