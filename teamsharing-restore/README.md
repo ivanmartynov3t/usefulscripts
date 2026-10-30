@@ -1,9 +1,10 @@
 # teamsharing-restore
 
-Interactive helper for the Ops runbook *"How to recover a user's Team
-Sharing data in case it was erroneously deleted"*. It takes a MongoDB Atlas
-snapshot archive, restores it into a local MongoDB **Docker** container you
-can open in Studio 3T, and removes everything again when you are done.
+Guided wizard for the Ops runbook *"How to recover a user's Team Sharing
+data in case it was erroneously deleted"*. It restores a MongoDB Atlas
+snapshot into a local MongoDB **Docker** container, finds the user's deleted
+documents, re-assigns them to the user's current ID and exports them ready
+for the (manual) production insert - then removes everything again.
 
 ## Requirements
 
@@ -32,6 +33,24 @@ shows progress (`[x]` done, `[ ]` open), keeps "Continue guided workflow"
 as the default choice, and still lets you run any single step again (e.g.
 recreate the container with another MongoDB version).
 
+**Nothing runs without your OK.** Each step first explains what it does.
+Before every command - `docker` commands, `mongosh` scripts (shown in full),
+creating, writing or deleting files and folders - the tool prints its
+purpose and the exact command and asks:
+
+```
+--- Next action: Stop the container so mongod releases the data files
+    docker stop 3cad91456b45...
+? Run it?
+ » Yes, run it
+   Yes, and run the remaining commands of this step without asking
+   No, cancel this step
+```
+
+Cancelling stops the step right there; it can be repeated later. Only
+internal read-only status checks (`docker info` / `inspect` / `ps`, the
+mongod `ping` while waiting for startup) run without asking.
+
 Workflow steps, in order:
 
 1. **Select backup archive** - the `.tar.gz` / `.tgz` snapshot downloaded from Atlas
@@ -50,15 +69,40 @@ Workflow steps, in order:
    document counts of the collections the runbook needs
    (`TEAM_SHARING_ENCRYPTED_PROD.{user,folder,resource,resourceContent,permission}`,
    `ENCRYPTION_PROD.__keyVault`)
+8. **Identify the affected user IDs** - looks the email up in `user`
+   (case-insensitive); you pick the old ID that lost its data (typically
+   `google-oauth2|...`, no license) and the ID that should own it now
+9. **Find the deleted documents** - the runbook's queries, for all of the
+   old user's folders at once:
+
+   | Collection | Query |
+   |---|---|
+   | `folder` | `{"creator.userId": OLD}` |
+   | `resource` | `{$or: [{folderId: {$in: folderIds}}, {"creator.userId": OLD}]}` |
+   | `resourceContent` | `{$or: [{folderId: {$in: folderIds}}, {_id: {$in: resource contentIds}}]}` |
+   | `permission` | `{$or: [{folderId: {$in: folderIds}}, {"creator.userId": OLD}, {"addressee.email": EMAIL}]}` |
+   | `ENCRYPTION_PROD.__keyVault` | `{keyAltNames: {$in: ["data-key-1-folder-key-<folderId>", ...]}}` |
+
+   Warns if a folder has no encryption key.
+10. **Fix ownership and export** - replaces every value equal to the old ID
+    with the new ID, in the **local** restored copy and in JSON files
+    (MongoDB Extended JSON, canonical) written to
+    `<working folder>/teamsharing-recovery-export/`, numbered in the
+    production insert order: `1-…__keyVault`, `2-…folder`,
+    `3-…permission`, `4-…resource`, `5-…resourceContent`. Documents that
+    still mention the old ID inside a longer value are flagged for review.
+
+The production insert itself stays manual, as in the runbook: with
+production access, insert the documents in the order above - copy them in
+Studio 3T from the local copy (`mongodb://127.0.0.1:50000/?directConnection=true`)
+or import the export files. The wizard prints these instructions at the end.
 
 Separate menu entry, run when the recovery is finished:
 
 - **Clean up everything** - removes the container, its volume, the image
-  (only if this tool pulled it), the extracted folder and the state file.
-  Deleting the original archive is offered separately (default: no)
-
-Then connect Studio 3T to `mongodb://127.0.0.1:50000/?directConnection=true`
-and follow the runbook from *"Find the affected user, folder and resources"*.
+  (only if this tool pulled it), the extracted folder, the export folder and
+  the state file. Deleting the original archive is offered separately
+  (default: no)
 
 ## Restarts
 
@@ -75,6 +119,11 @@ state file is lost.
 
 - The backup contains production customer data. Keep it on an encrypted
   disk and run cleanup as soon as the recovery is finished.
+- The export folder contains customer documents **and folder encryption key
+  material** from `__keyVault`. Don't copy it anywhere else; cleanup deletes it.
+- The state file holds the affected user's email and user IDs until cleanup.
+- The tool never connects to production; it only writes to the local
+  container and the local export folder.
 - MongoDB in the container runs **without authentication** and is reachable
   from `127.0.0.1` only. Do not change the port binding to expose it.
 - Cleanup only deletes a folder that contains the marker file this tool

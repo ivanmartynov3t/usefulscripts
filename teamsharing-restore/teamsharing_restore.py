@@ -6,19 +6,30 @@
 """
 Team Sharing backup restore helper.
 
-Automates the "Retrieve a backup" and "Spin up a MongoDB server" steps of the
-Ops runbook "How to recover a user's Team Sharing data in case it was
-erroneously deleted", but runs MongoDB inside Docker instead of a local
-mongod binary:
+Guided wizard for the Ops runbook "How to recover a user's Team Sharing data
+in case it was erroneously deleted". MongoDB runs inside Docker instead of a
+local mongod binary:
 
-  1. Select a MongoDB Atlas snapshot archive (.tar.gz / .tgz)
-  2. Select a working folder and extract the archive into it
-  3. Create and start a MongoDB container (version must match the backup's
-     featureCompatibilityVersion - 6.0 at the time the runbook was written)
-  4. Verify the container is up and mongod answers
-  5. Restore the extracted data files into the container's Docker volume
-  6. Verify the restored databases (TEAM_SHARING_ENCRYPTED_PROD, ENCRYPTION_PROD)
-  7. Clean up: container, volume, pulled image, extracted files, state
+   1. Select a MongoDB Atlas snapshot archive (.tar.gz / .tgz)
+   2. Select a working folder
+   3. Extract the archive into it
+   4. Create and start a MongoDB container (version must match the backup's
+      featureCompatibilityVersion - 6.0 at the time the runbook was written)
+   5. Verify the container is up and mongod answers
+   6. Restore the extracted data files into the container's Docker volume
+   7. Verify the restored databases (TEAM_SHARING_ENCRYPTED_PROD, ENCRYPTION_PROD)
+   8. Identify the old (unlicensed) and new user ID by the user's email
+   9. Find the deleted documents: folders, resources, resource contents,
+      permissions and folder keys in ENCRYPTION_PROD.__keyVault
+  10. Replace the old user ID with the new one (local copy only) and export
+      the documents as Extended JSON in production insert order
+  Inserting into production stays manual. "Clean up everything" removes the
+  container, volume, pulled image, extracted files, export and state.
+
+Before every command (docker, mongosh script, file/folder write or delete)
+the tool prints what it is for and the exact command, and asks to run it,
+run the rest of the step without asking, or cancel. Only internal read-only
+status checks (docker info/inspect/ps, the mongod ping) run without asking.
 
 Everything the tool creates is recorded in a state file, so the tool can be
 closed or the machine restarted at any point: on the next start it checks
@@ -77,6 +88,17 @@ EXPECTED_COLLECTIONS = {
     "ENCRYPTION_PROD": ["__keyVault"],
 }
 
+TEAM_SHARING_DB = "TEAM_SHARING_ENCRYPTED_PROD"
+EXPORT_DIR_NAME = "teamsharing-recovery-export"
+# Order in which the runbook inserts the recovered documents into production
+EXPORT_ORDER = [
+    "ENCRYPTION_PROD.__keyVault",
+    f"{TEAM_SHARING_DB}.folder",
+    f"{TEAM_SHARING_DB}.permission",
+    f"{TEAM_SHARING_DB}.resource",
+    f"{TEAM_SHARING_DB}.resourceContent",
+]
+
 
 def _state_dir() -> Path:
     base = os.environ.get("LOCALAPPDATA")
@@ -106,6 +128,12 @@ def _empty_state() -> Dict[str, object]:
         "volume": None,
         "restored": False,
         "db_verified": False,      # last database check found all runbook collections
+        "email": None,             # affected user's email
+        "old_user_id": None,       # unlicensed ID whose data was deleted (e.g. google-oauth2|...)
+        "new_user_id": None,       # ID the data must be re-assigned to
+        "found_counts": None,      # documents found per collection for old_user_id
+        "export_dir": None,        # folder this tool created for the fixed documents
+        "exported_for": None,      # [old_user_id, new_user_id] the export was made for
         "updated": None,
     }
 
@@ -136,8 +164,51 @@ class DockerError(RuntimeError):
     pass
 
 
-def docker(*args: str, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+class StepCancelled(Exception):
+    pass
+
+
+# Set when the user picks "run all remaining commands of this step"; reset before every step
+_approve_all = False
+
+
+def reset_approvals() -> None:
+    global _approve_all
+    _approve_all = False
+
+
+def approve(what: str, details: str) -> None:
+    """Show exactly what is about to happen and ask before doing it. Raises StepCancelled on 'no'."""
+    global _approve_all
+    print(f"\n--- Next action: {what}")
+    for line in details.splitlines():
+        print(f"    {line}")
+    if _approve_all:
+        print("    (approved: running all commands of this step)")
+        return
+    answer = questionary.select("Run it?", choices=[
+        questionary.Choice("Yes, run it", "yes"),
+        questionary.Choice("Yes, and run the remaining commands of this step without asking", "all"),
+        questionary.Choice("No, cancel this step", "no"),
+    ], default="yes").ask()
+    if answer == "all":
+        _approve_all = True
+    elif answer != "yes":
+        raise StepCancelled(what)
+
+
+def _format_script(script: str) -> str:
+    """Indent a mongosh script for display."""
+    return "\n".join("  " + line for line in script.strip().splitlines())
+
+
+def docker(*args: str, check: bool = True, capture: bool = True, describe: Optional[str] = None,
+           shown: Optional[str] = None) -> subprocess.CompletedProcess:
+    """Run a docker command. With `describe`, the command is shown and confirmed first
+    (internal read-only status checks pass no description and run silently)."""
     cmd = ["docker", *args]
+    if describe:
+        approve(describe, shown or subprocess.list2cmdline(cmd))
     result = subprocess.run(cmd, capture_output=capture, text=True, encoding="utf-8", errors="replace")
     if check and result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip() if capture else ""
@@ -185,8 +256,11 @@ def labelled_volumes() -> List[str]:
     return r.stdout.split() if r.returncode == 0 else []
 
 
-def mongosh(container_id: str, script: str) -> subprocess.CompletedProcess:
-    return docker("exec", container_id, "mongosh", "--quiet", "--norc", "--eval", script, check=False)
+def mongosh(container_id: str, script: str, describe: Optional[str] = None) -> subprocess.CompletedProcess:
+    shown = (f"docker exec {container_id[:12]} mongosh --quiet --norc --eval <script>\n"
+             f"script:\n{_format_script(script)}")
+    return docker("exec", container_id, "mongosh", "--quiet", "--norc", "--eval", script, check=False,
+                  describe=describe, shown=shown)
 
 
 def port_free(port: int) -> bool:
@@ -212,6 +286,10 @@ def reconcile(state: Dict[str, object], docker_ok: bool) -> None:
     if state["archive"] and not Path(state["archive"]).is_file():
         print(f"- Archive {state['archive']} no longer exists - reference removed.")
         state["archive"] = None
+        changed = True
+    if state["export_dir"] and not Path(state["export_dir"]).is_dir():
+        print(f"- Export folder {state['export_dir']} no longer exists - reference removed.")
+        state["export_dir"] = state["exported_for"] = None
         changed = True
     if docker_ok:
         if state["container_id"] and not container_info(state["container_id"]):
@@ -252,6 +330,11 @@ def print_status(state: Dict[str, object], docker_ok: bool) -> None:
         show("Container", None)
     show("Volume", state["volume"])
     show("Data restored", "yes" if state["restored"] else "no")
+    show("Old user ID", state["old_user_id"])
+    show("New user ID", state["new_user_id"])
+    if state["found_counts"]:
+        show("Found", ", ".join(f"{k.split('.')[-1]}: {v}" for k, v in state["found_counts"].items()))
+    show("Export", state["export_dir"])
     print(f"  (state file: {STATE_FILE})\n")
 
 
@@ -336,6 +419,11 @@ def extract_archive(state: Dict[str, object]) -> None:
               f"or remove it manually.")
         return
 
+    approve("Extract the backup archive",
+            f"create folder  {dest}\n"
+            f"extract        {archive}\n"
+            f"into           {dest}\n"
+            "(Python tarfile, safe mode: no paths outside the folder, no links or device files)")
     dest.mkdir(parents=True)
     (dest / EXTRACT_MARKER).write_text("created by teamsharing_restore.py\n", encoding="utf-8")
     state["extract_dir"] = str(dest)
@@ -370,7 +458,8 @@ def _pull_image(state: Dict[str, object], image: str) -> bool:
     if image_exists(image):
         return True
     print(f"Pulling {image} ...")
-    if docker("pull", image, check=False, capture=False).returncode != 0:
+    if docker("pull", image, check=False, capture=False,
+              describe=f"Download the official MongoDB image {image} from Docker Hub").returncode != 0:
         print(f"Could not pull {image}.")
         return False
     if image not in state["images_pulled"]:
@@ -381,10 +470,12 @@ def _pull_image(state: Dict[str, object], image: str) -> bool:
 
 def _remove_container_and_volume(state: Dict[str, object]) -> None:
     if state["container_id"]:
-        docker("rm", "-f", "-v", state["container_id"], check=False)
+        docker("rm", "-f", "-v", state["container_id"], check=False,
+               describe="Remove the existing container (force-stops it if running)")
         state["container_id"] = None
     if state["volume"]:
-        docker("volume", "rm", "-f", state["volume"], check=False)
+        docker("volume", "rm", "-f", state["volume"], check=False,
+               describe="Delete the container's data volume and the restored data in it")
         state["volume"] = None
     state["restored"] = False
     save_state(state)
@@ -426,20 +517,23 @@ def create_container(state: Dict[str, object]) -> None:
         return
 
     try:
-        docker("volume", "create", "--label", LABEL, VOLUME_NAME)
+        docker("volume", "create", "--label", LABEL, VOLUME_NAME,
+               describe=f"Create Docker volume '{VOLUME_NAME}' that will hold the MongoDB data files")
         state["volume"] = VOLUME_NAME
         save_state(state)
         r = docker("create", "--name", CONTAINER_NAME, "--label", LABEL,
                    "-p", f"127.0.0.1:{port}:27017",
                    "-v", f"{VOLUME_NAME}:{DATA_DIR_IN_CONTAINER}",
-                   image)
+                   image,
+                   describe=f"Create container '{CONTAINER_NAME}' from {image}: MongoDB port 27017 published "
+                            f"on 127.0.0.1:{port} only, data volume mounted at {DATA_DIR_IN_CONTAINER}")
         state["container_id"] = r.stdout.strip()
         state["image"] = image
         state["mongo_version"] = version
         state["port"] = port
         state["restored"] = False
         save_state(state)
-        docker("start", state["container_id"])
+        docker("start", state["container_id"], describe="Start the container (mongod starts on an empty database)")
     except DockerError as e:
         print(e)
         return
@@ -494,7 +588,7 @@ def verify_container(state: Dict[str, object]) -> bool:
         if not questionary.confirm("Start it now?", default=True).ask():
             return False
         try:
-            docker("start", state["container_id"])
+            docker("start", state["container_id"], describe="Start the stopped container")
         except DockerError as e:
             print(e)
             return False
@@ -513,18 +607,19 @@ def restore_data(state: Dict[str, object]) -> None:
         return
 
     cid = state["container_id"]
-    state["restored"] = state["db_verified"] = False
-    save_state(state)
     try:
-        print("Stopping container ...")
-        docker("stop", cid)
-        print("Clearing container data volume ...")
+        docker("stop", cid, describe="Stop the container so mongod releases the data files")
         docker("run", "--rm", "--label", LABEL, "-v", f"{state['volume']}:{DATA_DIR_IN_CONTAINER}",
-               "--entrypoint", "sh", state["image"], "-c", f"find {DATA_DIR_IN_CONTAINER} -mindepth 1 -delete")
-        print(f"Copying {state['dbpath']} into the container (this can take a few minutes) ...")
-        docker("cp", str(Path(state["dbpath"])) + os.sep + ".", f"{cid}:{DATA_DIR_IN_CONTAINER}")
-        print("Starting container ...")
-        docker("start", cid)
+               "--entrypoint", "sh", state["image"], "-c", f"find {DATA_DIR_IN_CONTAINER} -mindepth 1 -delete",
+               describe=f"Empty the data volume '{state['volume']}' using a temporary helper container "
+                        f"(removed automatically when done)")
+        state["restored"] = state["db_verified"] = False
+        state["found_counts"] = None
+        save_state(state)
+        docker("cp", str(Path(state["dbpath"])) + os.sep + ".", f"{cid}:{DATA_DIR_IN_CONTAINER}",
+               describe=f"Copy the extracted backup files into the container's {DATA_DIR_IN_CONTAINER} "
+                        f"(can take a few minutes)")
+        docker("start", cid, describe="Start the container on the restored data")
     except DockerError as e:
         print(e)
         return
@@ -542,24 +637,19 @@ def verify_databases(state: Dict[str, object]) -> None:
         print("Container is not running - use 'Verify container' first.")
         return
     script = (
-        "const out = {fcv: null, dbs: []};"
+        "const out = {fcv: null, dbs: []};\n"
         "try { out.fcv = db.adminCommand({getParameter: 1, featureCompatibilityVersion: 1})"
-        ".featureCompatibilityVersion.version; } catch (e) { out.fcv = 'unknown'; }"
-        "for (const d of db.adminCommand({listDatabases: 1}).databases) {"
-        "  const s = db.getSiblingDB(d.name); const cols = {};"
-        "  for (const c of s.getCollectionNames()) { cols[c] = s.getCollection(c).estimatedDocumentCount(); }"
-        "  out.dbs.push({name: d.name, size: Number(d.sizeOnDisk), collections: cols});"
-        "}"
-        "print(JSON.stringify(out));"
+        ".featureCompatibilityVersion.version; } catch (e) { out.fcv = 'unknown'; }\n"
+        "for (const d of db.adminCommand({listDatabases: 1}).databases) {\n"
+        "  const s = db.getSiblingDB(d.name); const cols = {};\n"
+        "  for (const c of s.getCollectionNames()) { cols[c] = s.getCollection(c).estimatedDocumentCount(); }\n"
+        "  out.dbs.push({name: d.name, size: Number(d.sizeOnDisk), collections: cols});\n"
+        "}\n"
+        "print(JSON.stringify(out));\n"
     )
-    r = mongosh(state["container_id"], script)
-    if r.returncode != 0:
-        print(f"Query failed: {(r.stderr or r.stdout).strip()}")
-        return
-    try:
-        result = json.loads(r.stdout.strip().splitlines()[-1])
-    except (ValueError, IndexError):
-        print(f"Unexpected output: {r.stdout.strip()[:500]}")
+    result = _run_json(state, script, "Read-only query: list databases, featureCompatibilityVersion and "
+                                      "document counts per collection")
+    if result is None:
         return
 
     print(f"\nfeatureCompatibilityVersion: {result['fcv']}")
@@ -584,6 +674,244 @@ def verify_databases(state: Dict[str, object]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Recovery: identify user, find deleted documents, fix ownership, export
+# (runbook sections "Find the affected user, folder and resources" and
+# "Fix the ownership"; the production insert itself stays manual)
+# ---------------------------------------------------------------------------
+
+def _restored_db_ready(state: Dict[str, object]) -> bool:
+    if not state["restored"]:
+        print("Restore the backup data first.")
+        return False
+    if not state["container_id"] or not container_running(state["container_id"]):
+        print("Container is not running - use 'Verify container is running' first.")
+        return False
+    return True
+
+
+def _run_json(state: Dict[str, object], script: str, describe: str) -> Optional[object]:
+    """Run a mongosh script that prints one JSON document on its last line and parse it."""
+    r = mongosh(state["container_id"], script, describe=describe)
+    if r.returncode != 0:
+        print(f"Query failed: {(r.stderr or r.stdout).strip()[:1000]}")
+        return None
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        print(f"Unexpected output: {r.stdout.strip()[:500]}")
+        return None
+
+
+def _choose_user_id(question: str, users: List[Dict[str, object]], exclude: Optional[str],
+                    default: Optional[str]) -> Optional[str]:
+    choices = [questionary.Choice(f"{u['userId']}  (license: {'assigned' if u['licensed'] else 'none'})",
+                                  u["userId"]) for u in users if u["userId"] != exclude]
+    choices.append(questionary.Choice("Enter manually...", "__manual__"))
+    values = [c.value for c in choices]
+    answer = questionary.select(question, choices=choices,
+                                default=default if default in values else None).ask()
+    if answer == "__manual__":
+        answer = (questionary.text("User ID:").ask() or "").strip() or None
+    return answer
+
+
+def identify_user(state: Dict[str, object]) -> None:
+    if not _restored_db_ready(state):
+        return
+    email = questionary.text("Affected user's email address:", default=state["email"] or "",
+                             validate=lambda v: "@" in v.strip() or "Enter an email address").ask()
+    if not email:
+        return
+    email = email.strip()
+    users = _run_json(state, (
+        f"const email = {json.dumps(email)};\n"
+        f"const users = db.getSiblingDB({json.dumps(TEAM_SHARING_DB)}).getCollection('user')"
+        ".find({email: email}).collation({locale: 'en', strength: 2}).toArray();\n"
+        "print(JSON.stringify(users.map(u => ({userId: String(u.userId),\n"
+        " licensed: u.license !== null && u.license !== undefined}))));\n"
+    ), f"Read-only query: find all records in {TEAM_SHARING_DB}.user with this email (case-insensitive)")
+    if users is None:
+        return
+    print(f"\nFound {len(users)} user record(s) for this email in {TEAM_SHARING_DB}.user:")
+    for u in users:
+        print(f"  {u['userId']}  (license: {'assigned' if u['licensed'] else 'none'})")
+    if not users and not questionary.confirm("No user found. Enter the IDs manually?", default=False).ask():
+        return
+
+    unlicensed = next((u["userId"] for u in users if not u["licensed"]), None)
+    old_id = _choose_user_id("Which ID lost its data (the one removed from the license)?", users, None,
+                             state["old_user_id"] or unlicensed)
+    if not old_id:
+        return
+    licensed = next((u["userId"] for u in users if u["licensed"] and u["userId"] != old_id), None)
+    new_id = _choose_user_id("Which ID should own the recovered data?", users, old_id,
+                             state["new_user_id"] or licensed)
+    if not new_id:
+        return
+    if new_id == old_id:
+        print("The old and new user ID must differ.")
+        return
+
+    if (old_id, new_id, email) != (state["old_user_id"], state["new_user_id"], state["email"]):
+        state["found_counts"] = None
+        state["exported_for"] = None
+    state["email"], state["old_user_id"], state["new_user_id"] = email, old_id, new_id
+    save_state(state)
+    print(f"Recovering data of {old_id} -> {new_id}")
+
+
+def _find_documents_js(state: Dict[str, object]) -> str:
+    """mongosh code that collects every document the runbook recovers into `found`."""
+    return (
+        f"const TS = db.getSiblingDB({json.dumps(TEAM_SHARING_DB)});\n"
+        f"const OLD = {json.dumps(state['old_user_id'])};\n"
+        f"const NEW = {json.dumps(state['new_user_id'])};\n"
+        f"const EMAIL = {json.dumps(state['email'])};\n"
+        "const idStr = id => (id && id.toHexString) ? id.toHexString() : String(id);\n"
+        "const folders = TS.getCollection('folder').find({'creator.userId': OLD}).toArray();\n"
+        "const fids = folders.map(f => f._id);\n"
+        "const resources = TS.getCollection('resource')"
+        ".find({$or: [{folderId: {$in: fids}}, {'creator.userId': OLD}]}).toArray();\n"
+        "const cids = resources.map(r => r.contentId).filter(c => c !== undefined && c !== null);\n"
+        "const contents = TS.getCollection('resourceContent')"
+        ".find({$or: [{folderId: {$in: fids}}, {_id: {$in: cids}}]}).toArray();\n"
+        "const permissions = TS.getCollection('permission')"
+        ".find({$or: [{folderId: {$in: fids}}, {'creator.userId': OLD}, {'addressee.email': EMAIL}]})"
+        ".collation({locale: 'en', strength: 2}).toArray();\n"
+        "const keyNames = fids.map(id => 'data-key-1-folder-key-' + idStr(id));\n"
+        "const keys = db.getSiblingDB('ENCRYPTION_PROD').getCollection('__keyVault')"
+        ".find({keyAltNames: {$in: keyNames}}).toArray();\n"
+        "const found = {\n"
+        "  'ENCRYPTION_PROD.__keyVault': keys,\n"
+        f"  {json.dumps(TEAM_SHARING_DB + '.folder')}: folders,\n"
+        f"  {json.dumps(TEAM_SHARING_DB + '.permission')}: permissions,\n"
+        f"  {json.dumps(TEAM_SHARING_DB + '.resource')}: resources,\n"
+        f"  {json.dumps(TEAM_SHARING_DB + '.resourceContent')}: contents,\n"
+        "};\n"
+    )
+
+
+def find_documents(state: Dict[str, object]) -> None:
+    if not _restored_db_ready(state):
+        return
+    if not state["old_user_id"] or not state["new_user_id"]:
+        print("Identify the user IDs first.")
+        return
+    result = _run_json(state, _find_documents_js(state) + (
+        "print(JSON.stringify({\n"
+        "  counts: Object.fromEntries(Object.entries(found).map(([k, v]) => [k, v.length])),\n"
+        "  folders: folders.map(f => ({id: idStr(f._id), name: String(f.name), deleted: f.deleted})),\n"
+        "  missingKeys: keyNames.filter(n => !keys.some(k => (k.keyAltNames || []).includes(n))),\n"
+        "}));\n"
+    ), "Read-only query: find the old user's folders, their resources, resource contents, permissions "
+       "and folder encryption keys")
+    if result is None:
+        return
+
+    print(f"\nFolders created by {state['old_user_id']}:")
+    for f in result["folders"]:
+        print(f"  {f['id']}  {f['name']}" + ("  (marked deleted)" if f["deleted"] else ""))
+    if not result["folders"]:
+        print("  none")
+    print("\nDocuments to recover (production insert order):")
+    for i, name in enumerate(EXPORT_ORDER, 1):
+        print(f"  {i}. {name:<46} {result['counts'][name]:>6}")
+    for key_name in result["missingKeys"]:
+        print(f"! No __keyVault entry found for {key_name} - that folder's content cannot be decrypted.")
+    if not any(result["counts"].values()):
+        print("Nothing found for this user ID - check that the right ID was selected as the old one.")
+        return
+    state["found_counts"] = result["counts"]
+    save_state(state)
+
+
+def _prepare_export_dir(state: Dict[str, object]) -> Optional[Path]:
+    export_dir = Path(state["workdir"]) / EXPORT_DIR_NAME
+    if export_dir.exists():
+        if not (export_dir / EXTRACT_MARKER).is_file():
+            print(f"{export_dir} exists and was not created by this tool - move it away first.")
+            return None
+        approve("Delete the previous export", f"delete folder  {export_dir}  (and all files in it)")
+        shutil.rmtree(export_dir, onerror=_force_remove)
+    approve("Create the export folder", f"create folder  {export_dir}")
+    export_dir.mkdir(parents=True)
+    (export_dir / EXTRACT_MARKER).write_text("created by teamsharing_restore.py\n", encoding="utf-8")
+    state["export_dir"] = str(export_dir)
+    state["exported_for"] = None
+    save_state(state)
+    return export_dir
+
+
+def fix_and_export(state: Dict[str, object]) -> None:
+    if not _restored_db_ready(state):
+        return
+    if not state["found_counts"]:
+        print("Find the affected documents first.")
+        return
+    print(f"Every value equal to {state['old_user_id']} is replaced with {state['new_user_id']}, both in the")
+    print("local restored copy (so you can copy the documents from Studio 3T) and in the exported files.")
+    print("Nothing is written to production.")
+    export_dir = _prepare_export_dir(state)
+    if not export_dir:
+        return
+
+    result = _run_json(state, _find_documents_js(state) + (
+        "const isPlain = v => v !== null && typeof v === 'object' && !v._bsontype\n"
+        "  && Object.prototype.toString.call(v) === '[object Object]';\n"
+        "const fix = v => {\n"
+        "  if (v === OLD) return NEW;\n"
+        "  if (Array.isArray(v)) return v.map(fix);\n"
+        "  if (isPlain(v)) { for (const k of Object.keys(v)) v[k] = fix(v[k]); }\n"
+        "  return v;\n"
+        "};\n"
+        "const leftovers = {};\n"
+        "for (const [name, docs] of Object.entries(found)) {\n"
+        "  const [dbName, ...rest] = name.split('.');\n"
+        "  const coll = db.getSiblingDB(dbName).getCollection(rest.join('.'));\n"
+        "  found[name] = docs.map(d => fix(d));\n"
+        "  for (const d of found[name]) coll.replaceOne({_id: d._id}, d);\n"
+        "  leftovers[name] = String(found[name].filter(d => EJSON.stringify(d).includes(OLD)).length);\n"
+        "}\n"
+        "print(EJSON.stringify({docs: found, leftovers: leftovers}, {relaxed: false}));\n"
+    ), f"WRITE to the LOCAL restored copy only: replace {state['old_user_id']} with {state['new_user_id']} "
+       f"in the found documents (replaceOne per document) and return them for export")
+    if result is None:
+        return
+
+    approve("Write the export files", "\n".join(
+        f"write  {export_dir / f'{i}-{name}.json'}  ({len(result['docs'][name])} documents)"
+        for i, name in enumerate(EXPORT_ORDER, 1)))
+    print(f"\nExported to {export_dir} (MongoDB Extended JSON, one array per file):")
+    total_left = 0
+    for i, name in enumerate(EXPORT_ORDER, 1):
+        docs = result["docs"][name]
+        path = export_dir / f"{i}-{name}.json"
+        path.write_text(json.dumps(docs, indent=2), encoding="utf-8")
+        left = int(result["leftovers"][name])
+        total_left += left
+        note = f"  ! {left} document(s) still mention the old ID" if left else ""
+        print(f"  {path.name:<54} {len(docs):>6} document(s){note}")
+    if total_left:
+        print("! The old ID still appears inside some values (not as a whole value). Review those documents.")
+    else:
+        print("No references to the old user ID remain.")
+    state["exported_for"] = [state["old_user_id"], state["new_user_id"]]
+    save_state(state)
+
+
+def print_production_instructions(state: Dict[str, object]) -> None:
+    print("\nLast step - restore on production (manual, per the runbook):")
+    print("  1. Get access to the Team Sharing production database from the database owner.")
+    print("  2. In Studio 3T, insert the documents in this order - either copy them from the local")
+    print(f"     copy (mongodb://127.0.0.1:{state['port']}/?directConnection=true) or import the files in")
+    print(f"     {state['export_dir']} (Import > JSON):")
+    for i, name in enumerate(EXPORT_ORDER, 1):
+        print(f"       {i}. {name}")
+    print("  3. Double-check the target database for every collection before inserting.")
+    print("  4. When done, run 'Clean up everything' - it also deletes the export folder.")
+
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 
@@ -592,17 +920,32 @@ def _force_remove(func, path, _exc_info) -> None:
     func(path)
 
 
+def _remove_owned_dir(path_str: Optional[str], what: str) -> bool:
+    """Delete a folder this tool created (it holds the marker file). Returns True if it is gone."""
+    path = Path(path_str) if path_str else None
+    if not path or not path.is_dir():
+        return True
+    if not (path / EXTRACT_MARKER).is_file():
+        print(f"Not removing {path}: marker file missing, it was not created by this tool.")
+        return False
+    approve(f"Delete the {what}", f"delete folder  {path}  (and all files in it)")
+    shutil.rmtree(path, onerror=_force_remove)
+    print(f"Removed {path}")
+    return True
+
+
 def _remove_extract_dir(state: Dict[str, object]) -> None:
-    extract_dir = Path(state["extract_dir"]) if state["extract_dir"] else None
-    if extract_dir and extract_dir.is_dir():
-        if (extract_dir / EXTRACT_MARKER).is_file():
-            shutil.rmtree(extract_dir, onerror=_force_remove)
-            print(f"Removed {extract_dir}")
-        else:
-            print(f"Not removing {extract_dir}: marker file missing, it was not created by this tool.")
-            return
+    if not _remove_owned_dir(state["extract_dir"], "extracted backup files"):
+        return
     state["extract_dir"] = state["dbpath"] = None
     state["restored"] = False
+    save_state(state)
+
+
+def _remove_export_dir(state: Dict[str, object]) -> None:
+    if not _remove_owned_dir(state["export_dir"], "exported recovery files"):
+        return
+    state["export_dir"] = state["exported_for"] = None
     save_state(state)
 
 
@@ -624,6 +967,8 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
         print(f"  image      {i}  (pulled by this tool)")
     if state["extract_dir"]:
         print(f"  folder     {state['extract_dir']}")
+    if state["export_dir"]:
+        print(f"  folder     {state['export_dir']}")
     print(f"  state      {STATE_FILE}")
     if not docker_ok and (state["container_id"] or state["volume"]):
         print("! Docker is not reachable - Docker objects cannot be removed now. Start Docker and run cleanup again.")
@@ -632,30 +977,38 @@ def cleanup(state: Dict[str, object], docker_ok: bool) -> None:
         return
 
     for c in containers:
-        r = docker("rm", "-f", "-v", c, check=False)
+        r = docker("rm", "-f", "-v", c, check=False, describe="Remove the container (force-stops it if running)")
         print(f"Removed container {c[:12]}" if r.returncode == 0 else f"! Could not remove container {c[:12]}")
-    state["container_id"] = None
+        if c == state["container_id"] and r.returncode == 0:
+            state["container_id"] = None
+            save_state(state)
     for v in volumes:
-        r = docker("volume", "rm", "-f", v, check=False)
+        r = docker("volume", "rm", "-f", v, check=False,
+                   describe="Delete the data volume and the restored database files in it")
         print(f"Removed volume {v}" if r.returncode == 0 else f"! Could not remove volume {v}: {r.stderr.strip()}")
-    state["volume"] = None
+        if v == state["volume"] and r.returncode == 0:
+            state["volume"] = None
+            save_state(state)
     for i in images:
-        r = docker("rmi", i, check=False)
+        r = docker("rmi", i, check=False, describe=f"Delete the Docker image {i} (downloaded by this tool)")
         print(f"Removed image {i}" if r.returncode == 0 else f"! Could not remove image {i} (in use?)")
     state["images_pulled"] = [i for i in images if image_exists(i)]
     save_state(state)
 
     _remove_extract_dir(state)
+    _remove_export_dir(state)
 
     if state["archive"] and Path(state["archive"]).is_file() and questionary.confirm(
             f"Also delete the backup archive {state['archive']}?", default=False).ask():
         Path(state["archive"]).unlink()
         print(f"Removed {state['archive']}")
 
-    leftovers = state["images_pulled"] or state["extract_dir"]
+    leftovers = (state["images_pulled"] or state["extract_dir"] or state["export_dir"]
+                 or state["container_id"] or state["volume"])
     if leftovers:
         print("! Some items could not be removed - state file kept so cleanup can be retried.")
         return
+    approve("Delete the tool's state file", f"delete file  {STATE_FILE}")
     STATE_FILE.unlink(missing_ok=True)
     try:
         STATE_FILE.parent.rmdir()
@@ -676,23 +1029,46 @@ class Step(NamedTuple):
     needs_docker: bool
     run: Callable[[Dict[str, object]], object]
     is_done: Callable[[Dict[str, object]], bool]
+    explain: str
 
 
 STEPS = [
     Step("archive", "Select backup archive (.tar.gz)", False, select_archive,
-         lambda s: bool(s["archive"])),
+         lambda s: bool(s["archive"]),
+         "Pick the daily Atlas snapshot (.tar.gz, ~300 MB) you received for the recovery. Nothing is changed."),
     Step("workdir", "Select working folder", False, select_workdir,
-         lambda s: bool(s["workdir"])),
+         lambda s: bool(s["workdir"]),
+         "Pick a folder with ~2 GB free space. The archive is extracted into a new subfolder there,\n"
+         "and the recovered documents are exported there later. Nothing is changed yet."),
     Step("extract", "Extract archive", False, extract_archive,
-         lambda s: bool(s["dbpath"])),
+         lambda s: bool(s["dbpath"]),
+         "Unpacks the snapshot (~1 GB) into a new subfolder and finds the MongoDB data files."),
     Step("create", "Create MongoDB container", True, create_container,
-         lambda s: bool(s["container_id"])),
+         lambda s: bool(s["container_id"]),
+         "Downloads the MongoDB image if needed, creates a data volume and a container that is\n"
+         "reachable from this machine only. The version must match the backup (6.0 per the runbook)."),
     Step("verify", "Verify container is running", True, verify_container,
-         lambda s: bool(s["container_id"]) and container_running(s["container_id"])),
+         lambda s: bool(s["container_id"]) and container_running(s["container_id"]),
+         "Checks that the container runs and mongod answers; offers to start it if it is stopped."),
     Step("restore", "Restore data into container", True, restore_data,
-         lambda s: bool(s["restored"])),
+         lambda s: bool(s["restored"]),
+         "Stops the container, empties its data volume, copies the extracted backup files in and\n"
+         "starts it again, then checks the databases."),
     Step("verify_db", "Verify databases", True, verify_databases,
-         lambda s: bool(s["restored"] and s["db_verified"])),
+         lambda s: bool(s["restored"] and s["db_verified"]),
+         "Read-only check that all collections the runbook needs exist, with document counts."),
+    Step("identify", "Identify the affected user IDs", True, identify_user,
+         lambda s: bool(s["old_user_id"] and s["new_user_id"]),
+         "Looks up the user's email in the user collection. You choose the old ID that lost its data\n"
+         "(usually google-oauth2|..., no license) and the ID that should own it now (licensed)."),
+    Step("find", "Find the deleted documents", True, find_documents,
+         lambda s: bool(s["old_user_id"] and s["found_counts"]),
+         "Read-only queries from the runbook: folders created by the old ID, their resources and\n"
+         "resource contents, related permissions, and each folder's encryption key in __keyVault."),
+    Step("export", "Fix ownership and export", True, fix_and_export,
+         lambda s: bool(s["export_dir"] and s["exported_for"] == [s["old_user_id"], s["new_user_id"]]),
+         "Replaces the old user ID with the new one in the found documents (local copy only) and\n"
+         "writes them as JSON files, numbered in the order they must be inserted into production."),
 ]
 
 
@@ -711,14 +1087,24 @@ def _print_progress(state: Dict[str, object], current: Optional[int]) -> None:
         print(f"  {mark} {i + 1}. {step.title}")
 
 
+def run_step(step: Step, state: Dict[str, object]) -> bool:
+    """Run one step; every command in it asks for approval. Returns False if the user cancelled."""
+    reset_approvals()
+    try:
+        step.run(state)
+    except StepCancelled as e:
+        print(f"\nCancelled at: {e}. Nothing further was run; the step can be repeated later.")
+        return False
+    return True
+
+
 def run_wizard(state: Dict[str, object], docker_ok: bool) -> None:
     """Walk the user through the remaining steps in order until done or they stop."""
     while True:
         index = next_step(state)
         if index is None:
-            print("\nAll steps are done. Open Studio 3T on "
-                  f"mongodb://127.0.0.1:{state['port']}/?directConnection=true and follow the runbook.")
-            print("When the recovery is finished, run 'Clean up everything' from the menu.")
+            print("\nAll automated steps are done.")
+            print_production_instructions(state)
             return
         step = STEPS[index]
         _print_progress(state, index)
@@ -727,7 +1113,9 @@ def run_wizard(state: Dict[str, object], docker_ok: bool) -> None:
                   f"then choose 'Re-check Docker' in the menu.")
             return
         print(f"\n=== Step {index + 1} of {len(STEPS)}: {step.title} ===")
-        step.run(state)
+        print(step.explain)
+        if not run_step(step, state):
+            return
         if step.is_done(state):
             following = next_step(state)
             if following is None:
@@ -762,7 +1150,8 @@ def run_menu() -> None:
         index = next_step(state)
         _print_progress(state, index)
         if index is None:
-            wizard_choice = questionary.Choice("> Workflow complete - show connection details", "wizard")
+            wizard_choice = questionary.Choice("> Workflow complete - show production restore instructions",
+                                               "wizard")
         else:
             wizard_choice = questionary.Choice(f"> Continue guided workflow (step {index + 1}: {STEPS[index].title})",
                                                "wizard")
@@ -784,15 +1173,20 @@ def run_menu() -> None:
             if action == "wizard":
                 run_wizard(state, docker_ok)
             elif action == "cleanup":
+                reset_approvals()
                 cleanup(state, docker_ok)
             elif action == "recheck":
                 docker_error = docker_available()
                 print(f"! {docker_error}" if docker_error else "Docker is available.")
                 reconcile(state, docker_error is None)
             else:
-                next(s for s in STEPS if s.key == action).run(state)
+                step = next(s for s in STEPS if s.key == action)
+                print(f"\n=== {step.title} ===\n{step.explain}")
+                run_step(step, state)
         except DockerError as e:
             print(f"! {e}")
+        except StepCancelled as e:
+            print(f"\nCancelled at: {e}. Nothing further was run.")
 
 
 def main() -> int:
