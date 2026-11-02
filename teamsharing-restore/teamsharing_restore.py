@@ -1013,6 +1013,28 @@ def fix_and_export(state: Dict[str, object]) -> None:
         print("No references to the old user ID remain.")
     state["exported_for"] = [state["old_user_id"], state["new_user_id"]]
     save_state(state)
+    _write_intellishell_scripts(export_dir)
+
+
+def _write_intellishell_scripts(export_dir: Path) -> None:
+    """Generate the guarded IntelliShell insert scripts next to the export (see intellishell_scripts.py)."""
+    try:
+        import intellishell_scripts
+    except ImportError:
+        print("! intellishell_scripts.py not found next to this tool - scripts not generated.")
+        return
+    prefix = questionary.text("Prefix for restored resource names (empty = keep original names):",
+                              default="[restored] ").ask()
+    if prefix is None:
+        return
+    out_dir = export_dir / "scripts"
+    approve("Write the IntelliShell restore scripts",
+            f"write  {out_dir}\\01-preflight.js .. 08-rollback.js\n"
+            f"(self-contained mongosh scripts holding the exported documents; insert only, idempotent, "
+            f"verified; production guard '{intellishell_scripts.DEFAULT_PROD_SET}')")
+    for p in intellishell_scripts.generate(export_dir, out_dir, intellishell_scripts.DEFAULT_PROD_SET,
+                                           prefix or None):
+        print(f"  {p.name:<34} {p.stat().st_size:>8} bytes")
 
 
 # mongosh code defining fix(): replaces every value equal to OLD with NEW (in place), skipping BSON types
@@ -1046,15 +1068,17 @@ def _run_fix_ownership(state: Dict[str, object]) -> Optional[object]:
 def print_production_instructions(state: Dict[str, object]) -> None:
     print("\nLast step - restore on production (manual, per the runbook):")
     print("  1. Get access to the Team Sharing production database from the database owner.")
-    print("  2. In Studio 3T, insert the documents in this order - either copy them from the local")
-    print(f"     copy (mongodb://127.0.0.1:{state['port']}/?directConnection=true) or import the files in")
-    print(f"     {state['export_dir']} (Import > JSON):")
+    print("  2. Recommended: run the generated scripts in a Studio 3T IntelliShell on the PRODUCTION")
+    print(f"     connection, one file at a time (F5), in this order, pasting each output into the ticket:")
+    print(f"       {state['export_dir']}\\scripts\\01-preflight.js .. 07-postcheck.js")
+    print("     They insert only (existing documents are skipped, never modified), verify every")
+    print("     document before and after writing, and refuse to run on any other cluster.")
+    print("     Alternative per runbook: copy the documents from the local copy")
+    print(f"     (mongodb://127.0.0.1:{state['port']}/?directConnection=true) with Insert mode, in this order:")
     for i, name in enumerate(EXPORT_ORDER, 1):
         print(f"       {i}. {name}")
-    print("  3. Insert only - do not upsert or overwrite: documents that still exist in production are")
-    print("     then rejected as duplicates instead of replacing live data.")
-    print("  4. Double-check the target database for every collection before inserting.")
-    print("  5. When done, run 'Clean up everything' - it also deletes the export folder.")
+    print("  3. Never upsert or overwrite - documents that still exist in production must stay as they are.")
+    print("  4. When done, run 'Clean up everything' - it also deletes the export folder and the scripts.")
     if state["rehearsal_ok"] and state["rehearsal_ok"] == state["exported_for"]:
         print("  (This export passed the restore rehearsal.)")
 
