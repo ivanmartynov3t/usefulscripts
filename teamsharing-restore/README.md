@@ -127,11 +127,31 @@ Workflow steps, in order:
    The rehearsal container can be removed right away; cleanup removes it
    too.
 
-The production insert itself stays manual, as in the runbook: with
-production access, insert the documents in the order above (insert only,
-no upsert/overwrite) - copy them in Studio 3T from the local copy
-(`mongodb://127.0.0.1:50000/?directConnection=true`) or import the export
-files. The wizard prints these instructions at the end.
+The production insert itself stays manual, as in the runbook. Step 6 also
+writes **IntelliShell scripts** for it into `<export>/scripts/`
+(`intellishell_scripts.py`, usable on its own:
+`python intellishell_scripts.py <export-dir> [--prefix "[restored] "]`):
+
+| Script | Does |
+|---|---|
+| `01-preflight.js` | read-only: production guard, how many export `_id`s already exist per collection |
+| `02`–`06-insert-*.js` | one per collection in insert order (`__keyVault`, `folder`, `permission`, `resourceContent`, `resource`) |
+| `07-postcheck.js` | read-only: every export `_id` present, no resource without content |
+| `08-rollback.js` | deletes only `_id`s you paste in from the insert scripts' output; needs `CONFIRM = true` |
+
+Why scripts rather than the Studio 3T import dialog: IntelliShell runs a
+script statement by statement and keeps going after a failed statement,
+and a 200 KB array literal in it once produced a truncated document. The
+generated scripts are built for that: every binary value, document and
+insert is its own statement; each document is checked before the insert
+(base64 length, FNV-1a checksum and `BinData.length()` against numbers in
+the script) and after it (`$binarySize` read back; a bad write is removed
+again); an `ABORT` flag stops all later statements once a guard fails;
+documents whose `_id` already exists are skipped, never modified, so the
+scripts are idempotent and also cover partial deletions; and a guard
+refuses any cluster whose replica set name isn't the production one.
+Run them in an IntelliShell on the production connection, one file at a
+time with F5, and keep each output as the audit trail.
 
 ## Cleanup - no garbage left
 
@@ -167,7 +187,9 @@ state file is lost.
 - The backup contains production customer data. Keep it on an encrypted
   disk and run cleanup as soon as the recovery is finished.
 - The export folder contains customer documents **and folder encryption key
-  material** from `__keyVault`. Don't copy it anywhere else; cleanup deletes it.
+  material** from `__keyVault`, and so do the generated scripts in it. Don't
+  copy them anywhere else and never commit them; cleanup deletes the folder.
+  This repository holds only the generator, no customer data.
 - The state file holds the affected user's email and user IDs until cleanup.
 - The tool never connects to production; it only writes to the local
   container and the local export folder.
