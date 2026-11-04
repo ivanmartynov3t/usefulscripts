@@ -153,6 +153,10 @@ refuses any cluster whose replica set name isn't the production one.
 Run them in an IntelliShell on the production connection, one file at a
 time with F5, and keep each output as the audit trail.
 
+Generic IntelliShell helpers (shell self-test, document diagnose, remove a
+broken document) live in [`intellishell/`](intellishell/); they hold no
+customer data and take their parameters at the top of each file.
+
 ## Cleanup - no garbage left
 
 - **Clean up everything** (menu) removes the containers, their volumes, the
